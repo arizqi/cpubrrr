@@ -1,0 +1,20 @@
+[package]
+name = "cputrain"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "CPU-first LLM inference and training-kernel research on Apple silicon"
+repository = "https://github.com/arizqi/cputrain"
+readme = "README.md"
+keywords = ["llm", "inference", "cpu", "simd", "moe"]
+categories = ["science", "command-line-utilities"]
+
+# engine + all bench_*/*_forward binaries auto-discover from src/bin/.
+# main.rs is the matmul ceiling ladder; name it explicitly.
+[[bin]]
+name = "bench_matmul"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1

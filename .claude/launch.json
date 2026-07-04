@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "demo",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["scripts/demo_server.py"],
+      "port": 8642
+    }
+  ]
+}

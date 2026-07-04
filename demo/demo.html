@@ -1,0 +1,112 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>CPU inference: cputrain vs llama.cpp</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0d0f14; color: #e6e6e6; font-family: -apple-system, "SF Pro", Helvetica, sans-serif; padding: 28px; }
+  h1 { font-size: 22px; font-weight: 600; margin-bottom: 4px; }
+  .sub { color: #8a92a6; font-size: 14px; margin-bottom: 20px; }
+  .bar { display: flex; gap: 12px; margin-bottom: 20px; }
+  input { flex: 1; background: #171a22; border: 1px solid #2a2f3d; color: #e6e6e6; border-radius: 10px; padding: 12px 16px; font-size: 15px; }
+  button { background: #6c5ce7; color: #fff; border: 0; border-radius: 10px; padding: 12px 26px; font-size: 15px; font-weight: 600; cursor: pointer; }
+  button:disabled { opacity: 0.4; }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  .pane { background: #12151c; border: 1px solid #232838; border-radius: 14px; padding: 18px; display: flex; flex-direction: column; height: 66vh; }
+  .pane h2 { font-size: 15px; font-weight: 600; color: #aab2c5; }
+  .pane.ours { border-color: #6c5ce7; }
+  .big { font-size: 44px; font-weight: 700; font-variant-numeric: tabular-nums; margin: 6px 0 2px; }
+  .ours .big { color: #a89bff; }
+  .oll .big { color: #ff9c8a; }
+  .unit { font-size: 14px; color: #8a92a6; }
+  .meta { font-size: 12.5px; color: #8a92a6; margin: 6px 0 10px; min-height: 16px; }
+  .out { flex: 1; overflow-y: auto; background: #0a0c10; border-radius: 10px; padding: 14px; font-family: "SF Mono", ui-monospace, monospace; font-size: 13px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; color: #cfd6e4; }
+  .final { font-size: 13px; color: #8a92a6; margin-top: 8px; min-height: 16px; }
+  .win { color: #7bd88f; font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>gpt-oss:20b on CPU — same chip, same model, same prompt</h1>
+<div class="sub">Left: Ollama / llama.cpp (CPU mode). Right: cputrain engine. Apple M4 Max, no GPU on either side.</div>
+<div class="bar">
+  <input id="prompt" value="Explain in a few sentences why the sky is blue." />
+  <button id="go" onclick="run()">Run both</button>
+</div>
+<div class="cols">
+  <div class="pane oll">
+    <h2>llama.cpp / Ollama (CPU)</h2>
+    <div class="big" id="rate_oll">0.0</div>
+    <div class="unit">tokens / second (live)</div>
+    <div class="meta" id="meta_oll"></div>
+    <div class="out" id="out_oll"></div>
+    <div class="final" id="fin_oll"></div>
+  </div>
+  <div class="pane ours">
+    <h2>cputrain engine (CPU)</h2>
+    <div class="big" id="rate_ours">0.0</div>
+    <div class="unit">tokens / second (live)</div>
+    <div class="meta" id="meta_ours"></div>
+    <div class="out" id="out_ours"></div>
+    <div class="final" id="fin_ours"></div>
+  </div>
+</div>
+<script>
+let running = 0;
+const done = {};
+function stream(side, prompt, andThen) {
+  running++;
+  const out = document.getElementById("out_" + side);
+  const rate = document.getElementById("rate_" + side);
+  const meta = document.getElementById("meta_" + side);
+  const fin = document.getElementById("fin_" + side);
+  out.textContent = ""; fin.textContent = ""; rate.textContent = "0.0";
+  meta.textContent = "starting...";
+  let t0 = null, chars = 0, toks = 0;
+  const es = new EventSource("/run_" + (side === "ours" ? "ours" : "ollama") + "?prompt=" + encodeURIComponent(prompt));
+  const timer = setInterval(() => {
+    if (t0) {
+      const el = (performance.now() - t0) / 1000;
+      const est = side === "ours" ? chars / 4.2 : toks;
+      rate.textContent = (est / Math.max(el, 0.05)).toFixed(1);
+    }
+  }, 120);
+  es.onmessage = (ev) => {
+    const d = JSON.parse(ev.data);
+    if (d.t === "status") meta.textContent = d.s;
+    if (d.t === "tok") {
+      if (!t0) { t0 = performance.now(); meta.textContent = "streaming"; }
+      chars += d.s.length; toks += 1;
+      out.textContent += d.s;
+      out.scrollTop = out.scrollHeight;
+    }
+    if (d.t === "done") {
+      clearInterval(timer); es.close();
+      const s = d.stats || {};
+      if (s.tok_s) rate.textContent = s.tok_s.toFixed(1);
+      fin.innerHTML = "final: <span class='win'>" + (s.tok_s || 0).toFixed(1) + " tok/s</span>" +
+        " &middot; " + (s.decode_tok || 0) + " tokens in " + (s.decode_s || 0).toFixed(2) + "s" +
+        " &middot; prefill " + (s.prefill_s || 0).toFixed(2) + "s";
+      meta.textContent = "done";
+      done[side] = s.tok_s;
+      if (andThen) andThen();
+      if (--running === 0 && done.ours && done.oll) {
+        const x = (done.ours / done.oll).toFixed(1);
+        document.querySelector(".sub").innerHTML =
+          "Left: Ollama / llama.cpp (CPU). Right: cputrain engine. <span class='win'>" + x + "&times; faster — same CPU, same model, no GPU.</span>";
+        document.getElementById("go").disabled = false;
+      }
+    }
+  };
+  es.onerror = () => { clearInterval(timer); es.close(); meta.textContent = "connection closed"; if (--running <= 0) document.getElementById("go").disabled = false; };
+}
+function run() {
+  const p = document.getElementById("prompt").value || "Why is the sky blue?";
+  document.getElementById("go").disabled = true;
+  delete done.ours; delete done.oll;
+  // sequential: each side gets the whole CPU (fair numbers, no core contention)
+  stream("oll", p, () => stream("ours", p));
+}
+</script>
+</body>
+</html>
