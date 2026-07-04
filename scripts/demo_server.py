@@ -6,15 +6,15 @@ import json, os, subprocess, threading, urllib.request, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ENGINE = os.environ.get("CPUTRAIN_ENGINE", os.path.join(ROOT, "target/release/engine"))
-GPTOSS_DIR = os.environ.get("CPUTRAIN_DATA", os.path.join(ROOT, "data"))
+ENGINE = os.environ.get("CPUBRRR_ENGINE", os.path.join(ROOT, "target/release/engine"))
+GPTOSS_DIR = os.environ.get("CPUBRRR_DATA", os.path.join(ROOT, "data"))
 _blobfile = os.path.join(GPTOSS_DIR, "blob_path.txt")
-BLOB = os.environ.get("CPUTRAIN_BLOB") or (
+BLOB = os.environ.get("CPUBRRR_BLOB") or (
     open(_blobfile).read().strip() if os.path.exists(_blobfile) else "")
 if not BLOB or not os.path.exists(BLOB):
     raise SystemExit(
         "model blob not found. Run scripts/setup_gptoss.sh first, "
-        "or set CPUTRAIN_BLOB to the gpt-oss GGUF path.")
+        "or set CPUBRRR_BLOB to the gpt-oss GGUF path.")
 NPRED = 256
 
 HARMONY = ("<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\n"

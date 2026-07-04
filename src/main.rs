@@ -293,7 +293,7 @@ fn max_abs_diff(x: &[f32], y: &[f32]) -> f32 {
 }
 
 fn main() {
-    let nthreads: usize = std::env::var("CPUTRAIN_THREADS")
+    let nthreads: usize = std::env::var("CPUBRRR_THREADS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(12); // P-cores on M4 Max

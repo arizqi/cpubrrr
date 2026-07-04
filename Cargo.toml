@@ -1,10 +1,10 @@
 [package]
-name = "cputrain"
+name = "cpubrrr"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "CPU-first LLM inference and training-kernel research on Apple silicon"
-repository = "https://github.com/arizqi/cputrain"
+repository = "https://github.com/arizqi/cpubrrr"
 readme = "README.md"
 keywords = ["llm", "inference", "cpu", "simd", "moe"]
 categories = ["science", "command-line-utilities"]

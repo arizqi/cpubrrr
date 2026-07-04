@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>CPU inference: cputrain vs llama.cpp</title>
+<title>CPU inference: cpubrrr vs llama.cpp</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: #0d0f14; color: #e6e6e6; font-family: -apple-system, "SF Pro", Helvetica, sans-serif; padding: 28px; }
@@ -28,7 +28,7 @@
 </head>
 <body>
 <h1>gpt-oss:20b on CPU — same chip, same model, same prompt</h1>
-<div class="sub">Left: Ollama / llama.cpp (CPU mode). Right: cputrain engine. Apple M4 Max, no GPU on either side.</div>
+<div class="sub">Left: Ollama / llama.cpp (CPU mode). Right: cpubrrr engine. Apple M4 Max, no GPU on either side.</div>
 <div class="bar">
   <input id="prompt" value="Explain in a few sentences why the sky is blue." />
   <button id="go" onclick="run()">Run both</button>
@@ -43,7 +43,7 @@
     <div class="final" id="fin_oll"></div>
   </div>
   <div class="pane ours">
-    <h2>cputrain engine (CPU)</h2>
+    <h2>cpubrrr engine (CPU)</h2>
     <div class="big" id="rate_ours">0.0</div>
     <div class="unit">tokens / second (live)</div>
     <div class="meta" id="meta_ours"></div>
@@ -93,7 +93,7 @@ function stream(side, prompt, andThen) {
       if (--running === 0 && done.ours && done.oll) {
         const x = (done.ours / done.oll).toFixed(1);
         document.querySelector(".sub").innerHTML =
-          "Left: Ollama / llama.cpp (CPU). Right: cputrain engine. <span class='win'>" + x + "&times; faster — same CPU, same model, no GPU.</span>";
+          "Left: Ollama / llama.cpp (CPU). Right: cpubrrr engine. <span class='win'>" + x + "&times; faster — same CPU, same model, no GPU.</span>";
         document.getElementById("go").disabled = false;
       }
     }

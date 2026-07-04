@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Prepare runtime data for the cputrain engine from a locally-pulled gpt-oss:20b.
+# Prepare runtime data for the cpubrrr engine from a locally-pulled gpt-oss:20b.
 #
 # Requires: ollama with gpt-oss:20b pulled (`ollama pull gpt-oss:20b`), python3.
 # Produces: data/tokens.bin, data/manifest.txt, data/blob_path.txt

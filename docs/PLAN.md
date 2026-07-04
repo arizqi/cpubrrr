@@ -1,4 +1,4 @@
-# cputrain — CPU-first LLM training runtime
+# cpubrrr — CPU-first LLM training runtime
 
 Research goal: how large a transformer can you *train* (not just run) on consumer
 Apple-silicon hardware in a reasonable wall-clock time, by optimizing from vector-math

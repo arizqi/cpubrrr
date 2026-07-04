@@ -1,8 +1,8 @@
-# cputrain
+# cpubrrr
 
 **Frontier-class LLM inference on a laptop CPU — 7.5× faster than llama.cpp, no GPU.**
 
-`cputrain` is a from-scratch research runtime that runs OpenAI's open
+`cpubrrr` is a from-scratch research runtime that runs OpenAI's open
 [`gpt-oss:20b`](https://huggingface.co/openai/gpt-oss-20b) model at **~110 tokens/second
 on an Apple M4 Max CPU**, versus **~15 tok/s** for llama.cpp on the same machine in
 CPU-only mode — producing **token-for-token identical output**. Everything below is
@@ -11,7 +11,7 @@ measured on real hardware and reproducible from this repo.
 | gpt-oss:20b decode, M4 Max, CPU only | tok/s |
 |---|---|
 | llama.cpp / Ollama (`num_gpu: 0`) | 14.7 |
-| **cputrain engine** | **109.9** |
+| **cpubrrr engine** | **109.9** |
 | *(reference) Ollama with Metal GPU* | 94.4 |
 
 The engine links only the C standard library — no Metal, no CoreML, no Accelerate, no
@@ -22,7 +22,7 @@ GPU of any kind (`otool -L target/release/engine` to verify).
 Modern frontier models are **mixture-of-experts (MoE)**: a 21B-parameter model only
 activates ~3.6B parameters per token. Token generation is therefore **memory-bandwidth
 bound**, not compute bound. llama.cpp's MoE path uses only ~11% of the CPU's memory
-bandwidth (measured); cputrain streams expert weights at the full ~293 GB/s the CPU
+bandwidth (measured); cpubrrr streams expert weights at the full ~293 GB/s the CPU
 cores can sustain. The core techniques:
 
 - Hand-written **NEON** (ARM SIMD) integer kernels using `sdot`/`tbl` for exact MXFP4
@@ -69,7 +69,7 @@ cargo build --release
 
 ### Side-by-side demo
 
-A local web page streams cputrain vs. llama.cpp/Ollama (CPU) with live tok/s counters:
+A local web page streams cpubrrr vs. llama.cpp/Ollama (CPU) with live tok/s counters:
 
 ```bash
 python3 scripts/demo_server.py     # then open http://localhost:8642
