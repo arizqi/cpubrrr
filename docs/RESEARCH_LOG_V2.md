@@ -67,3 +67,26 @@ Verification: gpt-oss:20b through the config-driven engine produces the CORRECT 
 concurrent 65GB gpt-oss:120b download — expected, since decode is memory-bandwidth-bound
 and the download's disk-write + memory traffic competes for the same ~290 GB/s. Will
 re-confirm ~110 tok/s post-download. Correctness (the point of the refactor) is proven.
+
+## 2026-07-05 — Qwen3-Coder-30B RUNS (new arch, correct first try)
+
+engine_qwen.rs: qwen3moe engine. Weights (Q4_K/Q6_K) dequantized to int8-per-32-block
+at load (verified dequant), whole engine on the Q8 sdot path. Arch per QWEN3_SPEC:
+QK-norm (RMSNorm Q/K per head pre-RoPE), plain SwiGLU (silu(gate)*up), router =
+softmax-over-128 → top-8 → renormalize, no sinks/SWA/qkv-bias, ChatML template.
+
+**Correctness: FIRST-TRY PASS.** Prompt "Write a Python function to reverse a string.":
+our output matches Ollama's greedy token-for-token from "## Method 1: Using slicing..."
+through the code block and docstring. (Intro line differs only due to system-prompt
+framing.) No garbage-debugging cycle — the verified-spec + verified-dequant approach
+(recover exact arch from llama.cpp source; verify k-quant dequant bit-exact vs gguf lib)
+worked as intended. This is the payoff of V1's hardest lesson (independent oracles).
+
+Move 3 (Qwen3-30B-A3B general) = same engine, same arch — drop-in once pulled.
+
+Speed: 8.1 tok/s — unoptimized AND the 65GB gpt-oss:120b download was competing for
+memory bandwidth. Slow because: (a) no persistent thread pool (std::thread::scope spawns
+12 threads per par_rows — ~9k spawns/token), (b) int8 weights = 2× bytes vs native 4-bit,
+(c) per-expert sequential loop with barriers. Optimization path is the known gpt-oss
+26→110 journey: persistent pool, MoE expert batching, native Q4_K 4-bit kernel. Correct
+first (done); fast second (next).
