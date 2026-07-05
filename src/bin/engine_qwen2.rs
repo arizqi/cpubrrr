@@ -12,7 +12,7 @@ use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
-const NT: usize = 10;
+const NT: usize = 12;
 const MAXSEQ: usize = 4096;
 static TM: [AtomicU64; 5] = [AtomicU64::new(0),AtomicU64::new(0),AtomicU64::new(0),AtomicU64::new(0),AtomicU64::new(0)];
 
@@ -249,7 +249,11 @@ fn bar(sh: &Shared, ls: &mut bool) {
         sh.bcount.store(0, Ordering::Relaxed);
         sh.bsense.store(*ls, Ordering::Release);
     } else {
-        while sh.bsense.load(Ordering::Acquire) != *ls { std::hint::spin_loop(); }
+        let mut n = 0u32;
+        while sh.bsense.load(Ordering::Acquire) != *ls {
+            n += 1;
+            if n & 1023 != 0 { std::hint::spin_loop(); } else { std::thread::yield_now(); }
+        }
     }
 }
 

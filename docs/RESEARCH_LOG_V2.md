@@ -277,3 +277,14 @@ vs llama.cpp 76.9 -> we are at ~77% of llama.cpp (behind, but robust + reproduci
 and ~2x the fork-join engine's 30). NT=12 was the fragility cliff; NT=10 is the sound
 default. This supersedes the retracted "65.5 beats 47.7" claims: real standing is
 cpubrrr ~59 vs llama.cpp ~77 on this model, honestly measured on a cool machine.
+
+## 2026-07-05 — Yield-barrier: NT=12 robust ~64 tok/s (uses all cores, no collapse)
+
+NT=10 sacrificed 2 cores vs llama.cpp's 12. Fix: NT=12 + a YIELDING barrier (spin
+~1024 then std::thread::yield_now) so 12 workers coexist with the OS. Verified:
+- isolation: stable ~64 tok/s (6 runs 60-66, no collapse).
+- under 2-core contention (2 bg burners): degrades gracefully to ~27, NO collapse
+  (pure-spin collapsed to ~5). The yield lets preempted workers reschedule.
+Honest standing: cpubrrr ~64 vs llama.cpp ~77 = 83% (robust). Yield barrier + all 12
+cores is the sound design; supersedes NT=10 (~59). Remaining gap to llama.cpp is
+kernel efficiency (they run the same Q4_K weights faster) — the real next lever.
