@@ -340,8 +340,10 @@ fn main() {
                     } }
                 });
             }
-            for h in 0..nh { rmsnorm_head(&mut q[h * hd..(h + 1) * hd], &ly.q_norm); rope(&mut q[h * hd..(h + 1) * hd], pos); }
-            for h in 0..nkv { rmsnorm_head(&mut k[h * hd..(h + 1) * hd], &ly.k_norm); rope(&mut k[h * hd..(h + 1) * hd], pos); }
+            { let (qp, kp) = (P(q.as_mut_ptr()), P(k.as_mut_ptr()));
+              par(nh + nkv, &|a, b| { for h in a..b {
+                  if h < nh { let sl = unsafe { std::slice::from_raw_parts_mut(qp.g().add(h * hd), hd) }; rmsnorm_head(sl, &ly.q_norm); rope(sl, pos); }
+                  else { let hh = h - nh; let sl = unsafe { std::slice::from_raw_parts_mut(kp.g().add(hh * hd), hd) }; rmsnorm_head(sl, &ly.k_norm); rope(sl, pos); } } }); }
             kc[il][pos * nkv * hd..(pos + 1) * nkv * hd].copy_from_slice(&k);
             vc[il][pos * nkv * hd..(pos + 1) * nkv * hd].copy_from_slice(&v);
             let scale = 1.0 / (hd as f32).sqrt();
@@ -382,21 +384,12 @@ fn main() {
 
             let (x2q, x2s, x2m) = quant_i8(&xn2);
             // gate+up batched over all active experts: topk*ff rows
-            let mut gbuf = vec![0f32; c.topk * ff];
-            let mut ubuf = vec![0f32; c.topk * ff];
-            {
-                let (gp, up_) = (P(gbuf.as_mut_ptr()), P(ubuf.as_mut_ptr()));
-                let (x2q, x2s, x2m, top) = (&x2q, &x2s, &x2m, &top);
-                // gate: pure sequential stream over gate tensor
-                par(c.topk * ff, &|a, b| { for it in a..b { let (ei, r) = (it / ff, it % ff);
-                    unsafe { *gp.g().add(it) = ly.gate.dot(top[ei] * ff + r, x2q.as_ptr(), x2s.as_ptr(), x2m.as_ptr()); } } });
-                // up: pure sequential stream over up tensor
-                par(c.topk * ff, &|a, b| { for it in a..b { let (ei, r) = (it / ff, it % ff);
-                    unsafe { *up_.g().add(it) = ly.up.dot(top[ei] * ff + r, x2q.as_ptr(), x2s.as_ptr(), x2m.as_ptr()); } } });
-            }
             let mut hbuf = vec![0f32; c.topk * ff];
-            { let out = P(hbuf.as_mut_ptr()); let (gb, ub) = (&gbuf, &ubuf);
-              par(c.topk * ff, &|a, b| { for it in a..b { let g = gb[it]; unsafe { *out.g().add(it) = (g / (1.0 + (-g).exp())) * ub[it]; } } }); }
+            { let out = P(hbuf.as_mut_ptr()); let (x2q, x2s, x2m, top) = (&x2q, &x2s, &x2m, &top);
+              par(c.topk * ff, &|a, b| { for it in a..b { let (ei, r) = (it / ff, it % ff); let gr = top[ei] * ff + r;
+                  let g = unsafe { ly.gate.dot(gr, x2q.as_ptr(), x2s.as_ptr(), x2m.as_ptr()) };
+                  let u = unsafe { ly.up.dot(gr, x2q.as_ptr(), x2s.as_ptr(), x2m.as_ptr()) };
+                  unsafe { *out.g().add(it) = (g / (1.0 + (-g).exp())) * u; } } }); }
             // down batched: topk*d rows, weighted accumulate
             let mut ffn = vec![0f32; c.topk * d];
             {

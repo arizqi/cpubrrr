@@ -153,3 +153,19 @@ glue) and lower barrier overhead. Path to ~100: that PLUS ~2× faster kernels (t
 bandwidth ceiling ~160 leaves room). This is a parallelism rearchitecture — a focused
 effort, not incremental tweaks. Incremental parallelization of serial chunks yields
 ~1 tok/s each (diminishing). Correctness preserved throughout (matches Ollama).
+
+## 2026-07-05 — grind continued: fuse FFN + parallel QK-norm (27.6 → 29.3)
+
+Fused gate+up+silu into one par (was 3 barriers), parallelized QK-norm/rope.
+29.3 tok/s, CPU util ~7.6/12 cores (up from 6.3). Correct throughout.
+
+Cumulative grind: 25.0 → 29.3 tok/s (+17%) over 8 measured optimizations. Every
+kernel micro-opt (reduction, accumulators, pair-loads, sequential streams) was ~flat;
+only parallelizing serial chunks moved it — confirming barrier/serialization limit.
+Util climbs slowly (6.3→7.6) as serial glue is parallelized piece by piece.
+
+HONEST STANDING: to beat llama.cpp (47.7) needs full core saturation (~12/12) = a
+parallelism rearchitecture (persistent per-layer parallel region, minimal barriers,
+all glue vectorized/parallel). To reach ~100 needs that PLUS ~2x kernel throughput.
+Both are real, scoped, multi-session efforts. Incremental tweaking has hit diminishing
+returns (~1 tok/s/change). Correct + improving; 100 remains an open optimization target.
