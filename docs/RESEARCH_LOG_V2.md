@@ -90,3 +90,18 @@ memory bandwidth. Slow because: (a) no persistent thread pool (std::thread::scop
 (c) per-expert sequential loop with barriers. Optimization path is the known gpt-oss
 26→110 journey: persistent pool, MoE expert batching, native Q4_K 4-bit kernel. Correct
 first (done); fast second (next).
+
+## 2026-07-05 — Qwen3-Coder optimization: 8 → 24.5 tok/s (under bandwidth contention)
+
+Three optimizations, output unchanged (still matches Ollama):
+1. Native 4-bit kernels: Q4_K/Q6_K weights stay in the 18GB blob (no int8-at-load);
+   matvec dequant-inline via NEON sdot. Verified bit-exact vs the dequant reference
+   (qk_mv_verify, rel ~1e-7). Halves weight bytes/token vs int8 → ~2× bandwidth.
+2. Persistent condvar thread pool (was spawning ~9k threads/token).
+3. MoE expert batching: gate+up as one par() over topk*ff rows, down as one over
+   topk*d — 2 barriers/layer for experts instead of 16.
+
+Result: 8.1 → 24.5 tok/s (3×) — measured WHILE the 65GB gpt-oss:120b download was
+still consuming memory bandwidth (the workload is bandwidth-bound, so this understates
+clean speed; est. ~40 tok/s clean). Next: quad-interleaved k-quant expert layout
+(the gpt-oss 51→110 lever), attention/quant fusion. Then clean re-measure.
