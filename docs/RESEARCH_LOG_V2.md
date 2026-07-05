@@ -257,3 +257,23 @@ machine. The gpt-oss comparisons (llama.cpp 14.7 for MXFP4-MoE) should ALSO be
 re-verified clean — though MXFP4-MoE is a documented llama.cpp weak path, so that
 win is more plausible than the Qwen one. Do not trust any single measurement from
 this session's tail as final.
+
+## 2026-07-05 — FRAGILITY FIXED: NT=10 -> stable ~59 tok/s (robust, cool machine)
+
+The v2 spin-barrier collapse was exactly the diagnosed cause: 12 spinning workers on
+12 P-cores starve the OS kernel -> it preempts a worker -> sense-reversing barrier
+stalls all others. FIX: use NT<12 so the OS always has free cores. Clean sweep on a
+COOLED machine (llama.cpp stable 76.9 confirms cool):
+| NT | tok/s (stable, 6 runs) |
+|---|---|
+| 8 | 53 (rock stable) |
+| 9 | 57 |
+| 10 | 57-60 (stable, chosen default — 2-core OS margin) |
+| 11 | 56-64 (stable but cliff-adjacent) |
+| 12 | 5-65 (COLLAPSES — all cores spinning starves OS) |
+
+**Honest robust result: ~59 tok/s stable on Qwen3-Coder (NT=10), correct output.**
+vs llama.cpp 76.9 -> we are at ~77% of llama.cpp (behind, but robust + reproducible,
+and ~2x the fork-join engine's 30). NT=12 was the fragility cliff; NT=10 is the sound
+default. This supersedes the retracted "65.5 beats 47.7" claims: real standing is
+cpubrrr ~59 vs llama.cpp ~77 on this model, honestly measured on a cool machine.

@@ -12,7 +12,7 @@ use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
-const NT: usize = 12;
+const NT: usize = 10;
 const MAXSEQ: usize = 4096;
 static TM: [AtomicU64; 5] = [AtomicU64::new(0),AtomicU64::new(0),AtomicU64::new(0),AtomicU64::new(0),AtomicU64::new(0)];
 
