@@ -32,7 +32,64 @@ fn load_cfg(dir: &str) {
         rope_base: gf("rope_freq_base"), rms_eps: gf("rms_eps"),
     }).ok();
 }
-const MAXSEQ: usize = 512;
+const MAXSEQ: usize = 4096;
+
+// ---- sampling controls (set per request in --serve mode; greedy when TEMP_MILLI=0) ----
+static TEMP_MILLI: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static TOPK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(40);
+static RNG_STATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x9E3779B97F4A7C15);
+
+fn rng_next() -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut x = RNG_STATE.load(Relaxed);
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    RNG_STATE.store(x, Relaxed);
+    x
+}
+
+/// Sample from logits with temperature + top-k (k<=64). Greedy if temp==0.
+fn sample_logits(logits: &[f32]) -> u32 {
+    let tm = TEMP_MILLI.load(std::sync::atomic::Ordering::Relaxed);
+    if tm == 0 {
+        let mut m = (f32::MIN, 0u32);
+        for (i, &l) in logits.iter().enumerate() {
+            if l > m.0 {
+                m = (l, i as u32);
+            }
+        }
+        return m.1;
+    }
+    let temp = tm as f32 / 1000.0;
+    let k = TOPK.load(std::sync::atomic::Ordering::Relaxed).clamp(1, 64);
+    // partial top-k: keep k best (small k -> linear scan insert is fine)
+    let mut top: Vec<(f32, u32)> = Vec::with_capacity(k + 1);
+    for (i, &l) in logits.iter().enumerate() {
+        if top.len() < k || l > top.last().unwrap().0 {
+            let pos = top.partition_point(|&(v, _)| v > l);
+            top.insert(pos, (l, i as u32));
+            if top.len() > k {
+                top.pop();
+            }
+        }
+    }
+    let mx = top[0].0;
+    let mut probs: Vec<f32> = top.iter().map(|&(l, _)| ((l - mx) / temp).exp()).collect();
+    let sum: f32 = probs.iter().sum();
+    for p in probs.iter_mut() {
+        *p /= sum;
+    }
+    let r = (rng_next() >> 11) as f32 / (1u64 << 53) as f32;
+    let mut acc = 0.0f32;
+    for (p, &(_, idx)) in probs.iter().zip(top.iter()) {
+        acc += p;
+        if r <= acc {
+            return idx;
+        }
+    }
+    top.last().unwrap().1
+}
 const KVI: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
 const NT: usize = 12; // worker threads
 static STAGE_NS: [std::sync::atomic::AtomicU64; 8] = [
@@ -802,9 +859,9 @@ fn main() {
         }
         let xn = rmsnorm(&x, &out_norm);
         let (xq, xs) = quant_i8(&xn);
-        let mut best = vec![(f32::MIN, 0u32); NT];
+        let mut logits = vec![0f32; cfg().nvocab];
         {
-            let bp = best.as_mut_ptr() as usize;
+            let lp = logits.as_mut_ptr() as usize;
             let chunk = (cfg().nvocab + NT - 1) / NT;
             std::thread::scope(|s| {
                 for t in 0..NT {
@@ -812,23 +869,19 @@ fn main() {
                     let b = ((t + 1) * chunk).min(cfg().nvocab);
                     let (xq, xs, head) = (&xq, &xs, &head);
                     s.spawn(move || {
-                        let mut m = (f32::MIN, 0u32);
                         for r in a..b {
                             let l = unsafe { head.dot(r, xq.as_ptr(), xs.as_ptr()) };
-                            if l > m.0 {
-                                m = (l, r as u32);
-                            }
+                            unsafe { *(lp as *mut f32).add(r) = l };
                         }
-                        unsafe { *(bp as *mut (f32, u32)).add(t) = m };
                     });
                 }
             });
         }
-        let am = best.iter().cloned().fold((f32::MIN, 0u32), |m, v| if v.0 > m.0 { v } else { m });
+        let chosen = sample_logits(&logits);
         if std::env::var("DUMP_POS").is_ok() {
-            eprintln!("  pos {pos} argmax {} logit {:.3}", am.1, am.0);
+            eprintln!("  pos {pos} chosen {} logit {:.3}", chosen, logits[chosen as usize]);
         }
-        am.1
+        chosen
     };
 
     let qkvd: usize = (cfg().nh + 2 * cfg().nkv) * cfg().hd;
@@ -1091,9 +1144,9 @@ fn main() {
         }
         let xn = rmsnorm(&xs[bsz - 1], &out_norm);
         let (xq2, xs2) = quant_i8(&xn);
-        let mut best = vec![(f32::MIN, 0u32); NT];
+        let mut logits = vec![0f32; cfg().nvocab];
         {
-            let bp = best.as_mut_ptr() as usize;
+            let lp = logits.as_mut_ptr() as usize;
             let chunk = (cfg().nvocab + NT - 1) / NT;
             std::thread::scope(|sc| {
                 for t in 0..NT {
@@ -1101,19 +1154,15 @@ fn main() {
                     let b2 = ((t + 1) * chunk).min(cfg().nvocab);
                     let (xq2, xs2, head) = (&xq2, &xs2, &head);
                     sc.spawn(move || {
-                        let mut m = (f32::MIN, 0u32);
                         for r in a..b2 {
                             let l = unsafe { head.dot(r, xq2.as_ptr(), xs2.as_ptr()) };
-                            if l > m.0 {
-                                m = (l, r as u32);
-                            }
+                            unsafe { *(lp as *mut f32).add(r) = l };
                         }
-                        unsafe { *(bp as *mut (f32, u32)).add(t) = m };
                     });
                 }
             });
         }
-        best.iter().cloned().fold((f32::MIN, 0u32), |m, v| if v.0 > m.0 { v } else { m }).1
+        sample_logits(&logits)
     };
 
     pool_init();
@@ -1129,6 +1178,49 @@ fn main() {
         if pline.trim().is_empty() {
             continue;
         }
+        // Serve protocol: either a bare prompt line, or TSV `temp \t seed \t ngen \t prompt`
+        // where prompt has newlines escaped as \n and tabs as \t (backslash-escaped).
+        let (req_ngen, pline) = {
+            let parts: Vec<&str> = pline.splitn(4, '\t').collect();
+            if parts.len() == 4 {
+                if let (Ok(temp), Ok(seed), Ok(ngen)) = (
+                    parts[0].parse::<f32>(),
+                    parts[1].parse::<u64>(),
+                    parts[2].parse::<usize>(),
+                ) {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    TEMP_MILLI.store((temp.max(0.0) * 1000.0) as u32, Relaxed);
+                    // splitmix64 scramble so adjacent seeds diverge; never zero
+                    let mut z = seed.wrapping_add(0x9E3779B97F4A7C15);
+                    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+                    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+                    RNG_STATE.store((z ^ (z >> 31)) | 1, Relaxed);
+                    let mut unescaped = String::with_capacity(parts[3].len());
+                    let mut it = parts[3].chars();
+                    while let Some(c) = it.next() {
+                        if c == '\\' {
+                            match it.next() {
+                                Some('n') => unescaped.push('\n'),
+                                Some('t') => unescaped.push('\t'),
+                                Some('\\') => unescaped.push('\\'),
+                                Some(o) => {
+                                    unescaped.push('\\');
+                                    unescaped.push(o)
+                                }
+                                None => unescaped.push('\\'),
+                            }
+                        } else {
+                            unescaped.push(c);
+                        }
+                    }
+                    (ngen.clamp(1, MAXSEQ), unescaped)
+                } else {
+                    (0, pline.clone())
+                }
+            } else {
+                (0, pline.clone())
+            }
+        };
         // full harmony prompt (matches Ollama's template for a plain chat turn)
         let system = "You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-07-03\n\nReasoning: low\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.";
         let mut ids: Vec<u32> = vec![200006];
@@ -1156,7 +1248,7 @@ fn main() {
         };
         let prefill_s = t1.elapsed().as_secs_f64();
 
-        let ngen = if serve { 256 } else { 96 };
+        let ngen = if req_ngen > 0 { req_ngen } else if serve { 256 } else { 96 };
         let t2 = Instant::now();
         let mut pos = ids.len();
         let mut emitted = 0usize;
