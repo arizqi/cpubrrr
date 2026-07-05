@@ -8,18 +8,31 @@ use std::collections::HashMap;
 use std::fs;
 use std::time::Instant;
 
-const D: usize = 2880;
-const NH: usize = 64;
-const NKV: usize = 8;
-const HD: usize = 64;
-const NL: usize = 24;
-const NE: usize = 32;
-const TOPK: usize = 4;
-const BLOCKS: usize = D / 32;
-const BPR: usize = BLOCKS * 17;
-const NVOCAB: usize = 201088;
+#[derive(Clone, Copy)]
+struct Cfg { d: usize, nh: usize, nkv: usize, hd: usize, nl: usize, ne: usize,
+    topk: usize, ffexp: usize, blocks: usize, bpr: usize, nvocab: usize, swa: usize,
+    rope_base: f32, rms_eps: f32 }
+static CFG: std::sync::OnceLock<Cfg> = std::sync::OnceLock::new();
+#[inline(always)]
+fn cfg() -> &'static Cfg { CFG.get().unwrap() }
+fn load_cfg(dir: &str) {
+    let mut m = std::collections::HashMap::new();
+    for l in fs::read_to_string(format!("{dir}/config.txt")).unwrap().lines() {
+        let mut it = l.split_whitespace();
+        if let (Some(k), Some(v)) = (it.next(), it.next()) { m.insert(k.to_string(), v.to_string()); }
+    }
+    let gi = |k: &str| m.get(k).unwrap_or_else(|| panic!("config missing {k}")).parse::<usize>().unwrap();
+    let gf = |k: &str| m.get(k).unwrap().parse::<f32>().unwrap();
+    let d = gi("n_embd");
+    CFG.set(Cfg {
+        d, nh: gi("n_head"), nkv: gi("n_head_kv"), hd: gi("head_dim"),
+        nl: gi("n_layer"), ne: gi("n_expert"), topk: gi("n_expert_used"),
+        ffexp: gi("n_ff_exp"), blocks: d / 32, bpr: (d / 32) * 17,
+        nvocab: gi("n_vocab"), swa: m.get("sliding_window").map(|v| v.parse().unwrap()).unwrap_or(1 << 30),
+        rope_base: gf("rope_freq_base"), rms_eps: gf("rms_eps"),
+    }).ok();
+}
 const MAXSEQ: usize = 512;
-const SWA: usize = 128;
 const KVI: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
 const NT: usize = 12; // worker threads
 static STAGE_NS: [std::sync::atomic::AtomicU64; 8] = [
@@ -98,7 +111,7 @@ unsafe fn dot_mxfp4_i8(row: *const u8, xq: *const i8, xsb: *const f32) -> f32 {
         let kv = vld1q_s8(KVI.as_ptr());
         let mask = vdupq_n_u8(0x0F);
         let mut accf = vdupq_n_f32(0.0);
-        for b in 0..BLOCKS {
+        for b in 0..cfg().blocks {
             let blk = row.add(b * 17);
             let scale = 2f32.powi(*blk as i32 - 128) * *xsb.add(b);
             let w = vld1q_u8(blk.add(1));
@@ -118,20 +131,20 @@ struct QuadMx {
     scale: Vec<f32>,
 }
 fn repack_mx(raw: *const u8, rows: usize) -> QuadMx {
-    let mut nib = vec![0u8; rows * BLOCKS * 16];
-    let mut scale = vec![0f32; rows * BLOCKS];
+    let mut nib = vec![0u8; rows * cfg().blocks * 16];
+    let mut scale = vec![0f32; rows * cfg().blocks];
     {
         let np = SendPtrU8(nib.as_mut_ptr());
         let sp = SendPtr(scale.as_mut_ptr());
         let rp = SendU8(raw as *mut u8 as *const u8);
         par_rows(rows / 4, |a, b| {
             for q in a..b {
-                for blk in 0..BLOCKS {
+                for blk in 0..cfg().blocks {
                     for r in 0..4 {
                         unsafe {
-                            let src = rp.get().add(((q * 4 + r) * BLOCKS + blk) * 17);
-                            *sp.get().add((q * BLOCKS + blk) * 4 + r) = 2f32.powi(*src as i32 - 128);
-                            std::ptr::copy_nonoverlapping(src.add(1), np.get().add((q * BLOCKS + blk) * 64 + r * 16), 16);
+                            let src = rp.get().add(((q * 4 + r) * cfg().blocks + blk) * 17);
+                            *sp.get().add((q * cfg().blocks + blk) * 4 + r) = 2f32.powi(*src as i32 - 128);
+                            std::ptr::copy_nonoverlapping(src.add(1), np.get().add((q * cfg().blocks + blk) * 64 + r * 16), 16);
                         }
                     }
                 }
@@ -151,7 +164,7 @@ impl SendPtrU8 {
     }
 }
 
-/// 4 rows x D against block-quantized int8 x, quad-interleaved MXFP4.
+/// 4 rows x cfg().d against block-quantized int8 x, quad-interleaved MXFP4.
 unsafe fn dot4_mx_i8(nib: *const u8, sc: *const f32, xq: *const i8, xsb: *const f32) -> [f32; 4] {
     unsafe {
         let kv = vld1q_s8(KVI.as_ptr());
@@ -162,7 +175,7 @@ unsafe fn dot4_mx_i8(nib: *const u8, sc: *const f32, xq: *const i8, xsb: *const 
         let mut a3 = vdupq_n_f32(0.0);
         let mut np = nib;
         let mut sp = sc;
-        for b in 0..BLOCKS {
+        for b in 0..cfg().blocks {
             let x0 = vld1q_s8(xq.add(b * 32));
             let x1 = vld1q_s8(xq.add(b * 32 + 16));
             let sv = vmulq_n_f32(vld1q_f32(sp), *xsb.add(b));
@@ -282,18 +295,18 @@ impl SendPtrI8 {
 
 fn rmsnorm(x: &[f32], w: &[f32]) -> Vec<f32> {
     let ms = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
-    let inv = 1.0 / (ms + 1e-5).sqrt();
+    let inv = 1.0 / (ms + cfg().rms_eps).sqrt();
     x.iter().zip(w).map(|(v, g)| v * inv * g).collect()
 }
 
 /// YaRN RoPE (freq_base 150000, factor 32, orig ctx 4096, beta 32/1, ext_factor 1).
 fn rope_yarn(v: &mut [f32], pos: usize) {
     if std::env::var("NO_ROPE").is_ok() { return; }
-    let half = HD / 2;
-    let base = 150000f32;
+    let half = cfg().hd / 2;
+    let base = cfg().rope_base;
     if std::env::var("PLAIN_ROPE").is_ok() {
         for i in 0..half {
-            let theta = pos as f32 * base.powf(-(2.0 * i as f32) / HD as f32);
+            let theta = pos as f32 * base.powf(-(2.0 * i as f32) / cfg().hd as f32);
             let (c, s) = (theta.cos(), theta.sin());
             let a = v[i];
             let b = v[half + i];
@@ -302,12 +315,12 @@ fn rope_yarn(v: &mut [f32], pos: usize) {
         }
         return;
     }
-    let fd = |beta: f32| HD as f32 * (4096.0 / (beta * 2.0 * std::f32::consts::PI)).ln() / (2.0 * base.ln());
+    let fd = |beta: f32| cfg().hd as f32 * (4096.0 / (beta * 2.0 * std::f32::consts::PI)).ln() / (2.0 * base.ln());
     let low = fd(32.0).floor().max(0.0);
-    let high = fd(1.0).ceil().min(HD as f32 - 1.0);
+    let high = fd(1.0).ceil().min(cfg().hd as f32 - 1.0);
     let mscale = 1.0 + 0.1 * 32f32.ln();
     for i in 0..half {
-        let theta_ex = pos as f32 * base.powf(-(2.0 * i as f32) / HD as f32);
+        let theta_ex = pos as f32 * base.powf(-(2.0 * i as f32) / cfg().hd as f32);
         let theta_in = theta_ex / 32.0;
         let y = (i as f32 - low) / (high - low).max(0.001);
         let mix = 1.0 - y.clamp(0.0, 1.0);
@@ -463,6 +476,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dir = &args[1];
     let blobp = &args[2];
+    load_cfg(dir);
     let prompt = args.get(3).cloned().unwrap_or_else(|| "Why is the sky blue?".into());
 
     // tokenizer
@@ -515,14 +529,14 @@ fn main() {
     let m = Model { blob, idx };
     eprintln!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
 
-    let layers: Vec<Layer> = (0..NL)
+    let layers: Vec<Layer> = (0..cfg().nl)
         .map(|i| Layer {
             attn_norm: m.f32v(&format!("blk.{i}.attn_norm.weight")),
             ffn_norm: m.f32v(&format!("blk.{i}.ffn_norm.weight")),
-            wq: Q8Mat::from_bf16(m.bf16(&format!("blk.{i}.attn_q.weight")), NH * HD, D),
-            wk: Q8Mat::from_bf16(m.bf16(&format!("blk.{i}.attn_k.weight")), NKV * HD, D),
-            wv: Q8Mat::from_bf16(m.bf16(&format!("blk.{i}.attn_v.weight")), NKV * HD, D),
-            wo: Q8Mat::from_bf16(m.bf16(&format!("blk.{i}.attn_out.weight")), D, NH * HD),
+            wq: Q8Mat::from_bf16(m.bf16(&format!("blk.{i}.attn_q.weight")), cfg().nh * cfg().hd, cfg().d),
+            wk: Q8Mat::from_bf16(m.bf16(&format!("blk.{i}.attn_k.weight")), cfg().nkv * cfg().hd, cfg().d),
+            wv: Q8Mat::from_bf16(m.bf16(&format!("blk.{i}.attn_v.weight")), cfg().nkv * cfg().hd, cfg().d),
+            wo: Q8Mat::from_bf16(m.bf16(&format!("blk.{i}.attn_out.weight")), cfg().d, cfg().nh * cfg().hd),
             bq: m.f32v(&format!("blk.{i}.attn_q.bias")),
             bk: m.f32v(&format!("blk.{i}.attn_k.bias")),
             bv: m.f32v(&format!("blk.{i}.attn_v.bias")),
@@ -530,9 +544,9 @@ fn main() {
             sinks: m.f32v(&format!("blk.{i}.attn_sinks")),
             ginp: m.f32v(&format!("blk.{i}.ffn_gate_inp.weight")),
             ginp_b: m.f32v(&format!("blk.{i}.ffn_gate_inp.bias")),
-            gate: repack_mx(m.mxfp4(&format!("blk.{i}.ffn_gate_exps.weight")), NE * D),
-            up: repack_mx(m.mxfp4(&format!("blk.{i}.ffn_up_exps.weight")), NE * D),
-            down: repack_mx(m.mxfp4(&format!("blk.{i}.ffn_down_exps.weight")), NE * D),
+            gate: repack_mx(m.mxfp4(&format!("blk.{i}.ffn_gate_exps.weight")), cfg().ne * cfg().d),
+            up: repack_mx(m.mxfp4(&format!("blk.{i}.ffn_up_exps.weight")), cfg().ne * cfg().d),
+            down: repack_mx(m.mxfp4(&format!("blk.{i}.ffn_down_exps.weight")), cfg().ne * cfg().d),
             gate_b: m.f32v(&format!("blk.{i}.ffn_gate_exps.bias")),
             up_b: m.f32v(&format!("blk.{i}.ffn_up_exps.bias")),
             down_b: m.f32v(&format!("blk.{i}.ffn_down_exps.bias")),
@@ -542,18 +556,18 @@ fn main() {
     let out_norm = m.f32v("output_norm.weight");
     eprintln!("quantizing attention + head to Q8...");
     let tq = Instant::now();
-    let head = Q8Mat::from_bf16(m.bf16("output.weight"), NVOCAB, D);
+    let head = Q8Mat::from_bf16(m.bf16("output.weight"), cfg().nvocab, cfg().d);
     eprintln!("quantized in {:.1}s", tq.elapsed().as_secs_f64());
 
     // KV caches
-    let mut kc = vec![vec![0f32; MAXSEQ * NKV * HD]; NL];
-    let mut vc = vec![vec![0f32; MAXSEQ * NKV * HD]; NL];
+    let mut kc = vec![vec![0f32; MAXSEQ * cfg().nkv * cfg().hd]; cfg().nl];
+    let mut vc = vec![vec![0f32; MAXSEQ * cfg().nkv * cfg().hd]; cfg().nl];
 
     // forward one token; returns logits argmax if want_logits
     let mut forward = |tok: u32, pos: usize, want: bool, kc: &mut Vec<Vec<f32>>, vc: &mut Vec<Vec<f32>>| -> u32 {
-        let mut x: Vec<f32> = (0..D)
+        let mut x: Vec<f32> = (0..cfg().d)
             .map(|j| {
-                let bits = (unsafe { *tok_embd.0.add(tok as usize * D + j) } as u32) << 16;
+                let bits = (unsafe { *tok_embd.0.add(tok as usize * cfg().d + j) } as u32) << 16;
                 f32::from_bits(bits)
             })
             .collect();
@@ -564,18 +578,18 @@ fn main() {
             let (xnq, xns) = quant_i8(&xn);
             drop(_t);
             let _t = Tick::new(1);
-            let mut qkv = vec![0f32; (NH + 2 * NKV) * HD];
+            let mut qkv = vec![0f32; (cfg().nh + 2 * cfg().nkv) * cfg().hd];
             {
                 let out = SendPtr(qkv.as_mut_ptr());
                 let (xnq, xns) = (&xnq, &xns);
-                par_rows(NH * HD + 2 * NKV * HD, |a, b| {
+                par_rows(cfg().nh * cfg().hd + 2 * cfg().nkv * cfg().hd, |a, b| {
                     for r in a..b {
-                        let (w, bias, base) = if r < NH * HD {
+                        let (w, bias, base) = if r < cfg().nh * cfg().hd {
                             (&ly.wq, &ly.bq, 0)
-                        } else if r < NH * HD + NKV * HD {
-                            (&ly.wk, &ly.bk, NH * HD)
+                        } else if r < cfg().nh * cfg().hd + cfg().nkv * cfg().hd {
+                            (&ly.wk, &ly.bk, cfg().nh * cfg().hd)
                         } else {
-                            (&ly.wv, &ly.bv, NH * HD + NKV * HD)
+                            (&ly.wv, &ly.bv, cfg().nh * cfg().hd + cfg().nkv * cfg().hd)
                         };
                         let rr = r - base;
                         unsafe {
@@ -586,41 +600,41 @@ fn main() {
             }
             drop(_t);
             let _t = Tick::new(2);
-            let (q, rest) = qkv.split_at_mut(NH * HD);
-            let (k, v) = rest.split_at_mut(NKV * HD);
-            for h in 0..NH {
-                rope_yarn(&mut q[h * HD..(h + 1) * HD], pos);
+            let (q, rest) = qkv.split_at_mut(cfg().nh * cfg().hd);
+            let (k, v) = rest.split_at_mut(cfg().nkv * cfg().hd);
+            for h in 0..cfg().nh {
+                rope_yarn(&mut q[h * cfg().hd..(h + 1) * cfg().hd], pos);
             }
-            for h in 0..NKV {
-                rope_yarn(&mut k[h * HD..(h + 1) * HD], pos);
+            for h in 0..cfg().nkv {
+                rope_yarn(&mut k[h * cfg().hd..(h + 1) * cfg().hd], pos);
             }
-            kc[il][pos * NKV * HD..(pos + 1) * NKV * HD].copy_from_slice(k);
-            vc[il][pos * NKV * HD..(pos + 1) * NKV * HD].copy_from_slice(v);
+            kc[il][pos * cfg().nkv * cfg().hd..(pos + 1) * cfg().nkv * cfg().hd].copy_from_slice(k);
+            vc[il][pos * cfg().nkv * cfg().hd..(pos + 1) * cfg().nkv * cfg().hd].copy_from_slice(v);
             // sliding window on even layers
-            let start = if (il + 1) % 2 != 0 { pos.saturating_sub(SWA - 1) } else { 0 };
+            let start = if (il + 1) % 2 != 0 { pos.saturating_sub(cfg().swa - 1) } else { 0 };
             drop(_t);
             let _t = Tick::new(3);
-            let scale = 1.0 / (HD as f32).sqrt();
-            let mut attnout = vec![0f32; NH * HD];
+            let scale = 1.0 / (cfg().hd as f32).sqrt();
+            let mut attnout = vec![0f32; cfg().nh * cfg().hd];
             {
                 let kcl: &[f32] = &kc[il];
                 let vcl: &[f32] = &vc[il];
                 let q: &[f32] = q;
                 let out = SendPtr(attnout.as_mut_ptr());
-                par_rows(NH, |ha, hb| {
+                par_rows(cfg().nh, |ha, hb| {
                     for h in ha..hb {
-                        let kvh = h / (NH / NKV);
+                        let kvh = h / (cfg().nh / cfg().nkv);
                         let qp = q.as_ptr();
                         let mut scores: Vec<f32> = (start..=pos)
                             .map(|t| unsafe {
-                                let kp = kcl.as_ptr().add((t * NKV + kvh) * HD);
-                                let qh = qp.add(h * HD);
+                                let kp = kcl.as_ptr().add((t * cfg().nkv + kvh) * cfg().hd);
+                                let qh = qp.add(h * cfg().hd);
                                 let mut a0 = vdupq_n_f32(0.0);
                                 let mut a1 = vdupq_n_f32(0.0);
                                 let mut a2 = vdupq_n_f32(0.0);
                                 let mut a3 = vdupq_n_f32(0.0);
                                 let mut j = 0;
-                                while j < HD {
+                                while j < cfg().hd {
                                     a0 = vfmaq_f32(a0, vld1q_f32(kp.add(j)), vld1q_f32(qh.add(j)));
                                     a1 = vfmaq_f32(a1, vld1q_f32(kp.add(j + 4)), vld1q_f32(qh.add(j + 4)));
                                     a2 = vfmaq_f32(a2, vld1q_f32(kp.add(j + 8)), vld1q_f32(qh.add(j + 8)));
@@ -639,7 +653,7 @@ fn main() {
                         unsafe {
                             let mut acc = [vdupq_n_f32(0.0); 16];
                             for (ti, t) in (start..=pos).enumerate() {
-                                let vp = vcl.as_ptr().add((t * NKV + kvh) * HD);
+                                let vp = vcl.as_ptr().add((t * cfg().nkv + kvh) * cfg().hd);
                                 let sv = scores[ti];
                                 for u in 0..16 {
                                     acc[u] = vfmaq_n_f32(acc[u], vld1q_f32(vp.add(u * 4)), sv);
@@ -647,7 +661,7 @@ fn main() {
                             }
                             let inv = 1.0 / denom;
                             for u in 0..16 {
-                                vst1q_f32(out.get().add(h * HD + u * 4), vmulq_n_f32(acc[u], inv));
+                                vst1q_f32(out.get().add(h * cfg().hd + u * 4), vmulq_n_f32(acc[u], inv));
                             }
                         }
                     }
@@ -659,7 +673,7 @@ fn main() {
                 let (aoq, aos) = quant_i8(&attnout);
                 let out = SendPtr(x.as_mut_ptr());
                 let (aoq, aos) = (&aoq, &aos);
-                par_rows(D, |a, b| {
+                par_rows(cfg().d, |a, b| {
                     for r in a..b {
                         unsafe {
                             *out.get().add(r) += ly.wo.dot(r, aoq.as_ptr(), aos.as_ptr()) + ly.bo[r];
@@ -671,18 +685,18 @@ fn main() {
             let _t = Tick::new(5);
             // ---- MoE FFN ----
             let xn2 = rmsnorm(&x, &ly.ffn_norm);
-            let logits: Vec<f32> = (0..NE)
+            let logits: Vec<f32> = (0..cfg().ne)
                 .map(|e| {
                     let mut a = ly.ginp_b[e];
-                    for j in 0..D {
-                        a += ly.ginp[e * D + j] * xn2[j];
+                    for j in 0..cfg().d {
+                        a += ly.ginp[e * cfg().d + j] * xn2[j];
                     }
                     a
                 })
                 .collect();
-            let mut order: Vec<usize> = (0..NE).collect();
+            let mut order: Vec<usize> = (0..cfg().ne).collect();
             order.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
-            let top = &order[..TOPK];
+            let top = &order[..cfg().topk];
             let mx = top.iter().map(|&e| logits[e]).fold(f32::MIN, f32::max);
             let exps: Vec<f32> = top.iter().map(|&e| (logits[e] - mx).exp()).collect();
             let sum: f32 = exps.iter().sum();
@@ -691,44 +705,44 @@ fn main() {
             drop(_t);
             let _t = Tick::new(6);
             let (xq, xs) = quant_i8(&xn2);
-            let mut gu = vec![0f32; TOPK * 2 * D];
+            let mut gu = vec![0f32; cfg().topk * 2 * cfg().d];
             {
                 let out = SendPtr(gu.as_mut_ptr());
                 let (xq, xs, top) = (&xq, &xs, &top);
-                let dq = D / 4;
-                par_rows(TOPK * 2 * dq, |a, b| {
+                let dq = cfg().d / 4;
+                par_rows(cfg().topk * 2 * dq, |a, b| {
                     for it in a..b {
                         let ei = it / (2 * dq);
                         let e = top[ei];
                         let rem = it % (2 * dq);
                         let (w, bias, qd, obase) = if rem < dq {
-                            (&ly.gate, &ly.gate_b, rem, ei * 2 * D)
+                            (&ly.gate, &ly.gate_b, rem, ei * 2 * cfg().d)
                         } else {
-                            (&ly.up, &ly.up_b, rem - dq, ei * 2 * D + D)
+                            (&ly.up, &ly.up_b, rem - dq, ei * 2 * cfg().d + cfg().d)
                         };
                         let qg = e * dq + qd;
                         let acc = unsafe {
                             dot4_mx_i8(
-                                w.nib.as_ptr().add(qg * BLOCKS * 64),
-                                w.scale.as_ptr().add(qg * BLOCKS * 4),
+                                w.nib.as_ptr().add(qg * cfg().blocks * 64),
+                                w.scale.as_ptr().add(qg * cfg().blocks * 4),
                                 xq.as_ptr(),
                                 xs.as_ptr(),
                             )
                         };
                         for i in 0..4 {
-                            unsafe { *out.get().add(obase + qd * 4 + i) = acc[i] + bias[e * D + qd * 4 + i] };
+                            unsafe { *out.get().add(obase + qd * 4 + i) = acc[i] + bias[e * cfg().d + qd * 4 + i] };
                         }
                     }
                 });
             }
             const ALPHA: f32 = 1.702;
             const LIM: f32 = 7.0;
-            let mut hq = vec![0i8; TOPK * D];
-            let mut hs = vec![0f32; TOPK * BLOCKS];
-            for ei in 0..TOPK {
-                let g = &gu[ei * 2 * D..ei * 2 * D + D];
-                let u = &gu[ei * 2 * D + D..ei * 2 * D + 2 * D];
-                let h: Vec<f32> = (0..D)
+            let mut hq = vec![0i8; cfg().topk * cfg().d];
+            let mut hs = vec![0f32; cfg().topk * cfg().blocks];
+            for ei in 0..cfg().topk {
+                let g = &gu[ei * 2 * cfg().d..ei * 2 * cfg().d + cfg().d];
+                let u = &gu[ei * 2 * cfg().d + cfg().d..ei * 2 * cfg().d + 2 * cfg().d];
+                let h: Vec<f32> = (0..cfg().d)
                     .map(|k| {
                         let xg = g[k].min(LIM);
                         let yu = u[k].clamp(-LIM, LIM);
@@ -736,18 +750,18 @@ fn main() {
                     })
                     .collect();
                 let (q8, s8) = quant_i8(&h);
-                hq[ei * D..(ei + 1) * D].copy_from_slice(&q8);
-                hs[ei * BLOCKS..(ei + 1) * BLOCKS].copy_from_slice(&s8);
+                hq[ei * cfg().d..(ei + 1) * cfg().d].copy_from_slice(&q8);
+                hs[ei * cfg().blocks..(ei + 1) * cfg().blocks].copy_from_slice(&s8);
             }
             drop(_t);
             let _t = Tick::new(7);
             // down-proj: single fused pass, 4 experts to disjoint buffers, weighted
-            let mut ffn4 = vec![0f32; TOPK * D];
+            let mut ffn4 = vec![0f32; cfg().topk * cfg().d];
             {
                 let contrib = SendPtr(ffn4.as_mut_ptr());
                 let (hq, hs, top, wts) = (&hq, &hs, &top, &wts);
-                let dq = D / 4;
-                par_rows(TOPK * dq, |a, b| {
+                let dq = cfg().d / 4;
+                par_rows(cfg().topk * dq, |a, b| {
                     for it in a..b {
                         let ei = it / dq;
                         let e = top[ei];
@@ -755,23 +769,23 @@ fn main() {
                         let qg = e * dq + qd;
                         let acc = unsafe {
                             dot4_mx_i8(
-                                ly.down.nib.as_ptr().add(qg * BLOCKS * 64),
-                                ly.down.scale.as_ptr().add(qg * BLOCKS * 4),
-                                hq.as_ptr().add(ei * D),
-                                hs.as_ptr().add(ei * BLOCKS),
+                                ly.down.nib.as_ptr().add(qg * cfg().blocks * 64),
+                                ly.down.scale.as_ptr().add(qg * cfg().blocks * 4),
+                                hq.as_ptr().add(ei * cfg().d),
+                                hs.as_ptr().add(ei * cfg().blocks),
                             )
                         };
                         for i in 0..4 {
                             unsafe {
-                                *contrib.get().add(ei * D + qd * 4 + i) = wts[ei] * (acc[i] + ly.down_b[e * D + qd * 4 + i])
+                                *contrib.get().add(ei * cfg().d + qd * 4 + i) = wts[ei] * (acc[i] + ly.down_b[e * cfg().d + qd * 4 + i])
                             };
                         }
                     }
                 });
             }
-            for ei in 0..TOPK {
-                for kx in 0..D {
-                    x[kx] += ffn4[ei * D + kx];
+            for ei in 0..cfg().topk {
+                for kx in 0..cfg().d {
+                    x[kx] += ffn4[ei * cfg().d + kx];
                 }
             }
             drop(_t);
@@ -791,11 +805,11 @@ fn main() {
         let mut best = vec![(f32::MIN, 0u32); NT];
         {
             let bp = best.as_mut_ptr() as usize;
-            let chunk = (NVOCAB + NT - 1) / NT;
+            let chunk = (cfg().nvocab + NT - 1) / NT;
             std::thread::scope(|s| {
                 for t in 0..NT {
                     let a = t * chunk;
-                    let b = ((t + 1) * chunk).min(NVOCAB);
+                    let b = ((t + 1) * chunk).min(cfg().nvocab);
                     let (xq, xs, head) = (&xq, &xs, &head);
                     s.spawn(move || {
                         let mut m = (f32::MIN, 0u32);
@@ -817,7 +831,7 @@ fn main() {
         am.1
     };
 
-    const QKV: usize = (NH + 2 * NKV) * HD;
+    let qkvd: usize = (cfg().nh + 2 * cfg().nkv) * cfg().hd;
     const TILE: usize = 8; // tokens per tile: 8 x 2880 i8 activations stay L1-resident
     // Batched prefill: one pass over weights serves the whole prompt (rows stay L1-hot
     // across tokens). Causal: token b attends cache 0..=pos0+b only.
@@ -826,8 +840,8 @@ fn main() {
         let mut xs: Vec<Vec<f32>> = toks
             .iter()
             .map(|&t| {
-                (0..D)
-                    .map(|j| f32::from_bits((unsafe { *tok_embd.get().add(t as usize * D + j) } as u32) << 16))
+                (0..cfg().d)
+                    .map(|j| f32::from_bits((unsafe { *tok_embd.get().add(t as usize * cfg().d + j) } as u32) << 16))
                     .collect()
             })
             .collect();
@@ -839,24 +853,24 @@ fn main() {
                     quant_i8(&xn)
                 })
                 .collect();
-            let mut qkvs = vec![0f32; bsz * QKV];
+            let mut qkvs = vec![0f32; bsz * qkvd];
             for t0 in (0..bsz).step_by(TILE) {
                 let t1e = (t0 + TILE).min(bsz);
                 let out = SendPtr(qkvs.as_mut_ptr());
                 let xnq = &xnq;
-                par_rows(QKV, |a, b2| {
+                par_rows(qkvd, |a, b2| {
                     for r in a..b2 {
-                        let (w, bias, base) = if r < NH * HD {
+                        let (w, bias, base) = if r < cfg().nh * cfg().hd {
                             (&ly.wq, &ly.bq, 0)
-                        } else if r < NH * HD + NKV * HD {
-                            (&ly.wk, &ly.bk, NH * HD)
+                        } else if r < cfg().nh * cfg().hd + cfg().nkv * cfg().hd {
+                            (&ly.wk, &ly.bk, cfg().nh * cfg().hd)
                         } else {
-                            (&ly.wv, &ly.bv, NH * HD + NKV * HD)
+                            (&ly.wv, &ly.bv, cfg().nh * cfg().hd + cfg().nkv * cfg().hd)
                         };
                         let rr = r - base;
                         for b in t0..t1e {
                             unsafe {
-                                *out.get().add(b * QKV + r) =
+                                *out.get().add(b * qkvd + r) =
                                     w.dot(rr, xnq[b].0.as_ptr(), xnq[b].1.as_ptr()) + bias[rr];
                             }
                         }
@@ -865,43 +879,43 @@ fn main() {
             }
             for b in 0..bsz {
                 let pos = pos0 + b;
-                let base = b * QKV;
-                for h in 0..NH {
-                    rope_yarn(&mut qkvs[base + h * HD..base + (h + 1) * HD], pos);
+                let base = b * qkvd;
+                for h in 0..cfg().nh {
+                    rope_yarn(&mut qkvs[base + h * cfg().hd..base + (h + 1) * cfg().hd], pos);
                 }
-                for h in 0..NKV {
-                    let o = base + NH * HD + h * HD;
-                    rope_yarn(&mut qkvs[o..o + HD], pos);
+                for h in 0..cfg().nkv {
+                    let o = base + cfg().nh * cfg().hd + h * cfg().hd;
+                    rope_yarn(&mut qkvs[o..o + cfg().hd], pos);
                 }
-                kc[il][pos * NKV * HD..(pos + 1) * NKV * HD]
-                    .copy_from_slice(&qkvs[base + NH * HD..base + NH * HD + NKV * HD]);
-                vc[il][pos * NKV * HD..(pos + 1) * NKV * HD]
-                    .copy_from_slice(&qkvs[base + NH * HD + NKV * HD..base + QKV]);
+                kc[il][pos * cfg().nkv * cfg().hd..(pos + 1) * cfg().nkv * cfg().hd]
+                    .copy_from_slice(&qkvs[base + cfg().nh * cfg().hd..base + cfg().nh * cfg().hd + cfg().nkv * cfg().hd]);
+                vc[il][pos * cfg().nkv * cfg().hd..(pos + 1) * cfg().nkv * cfg().hd]
+                    .copy_from_slice(&qkvs[base + cfg().nh * cfg().hd + cfg().nkv * cfg().hd..base + qkvd]);
             }
-            let scale = 1.0 / (HD as f32).sqrt();
-            let mut aouts = vec![0f32; bsz * NH * HD];
+            let scale = 1.0 / (cfg().hd as f32).sqrt();
+            let mut aouts = vec![0f32; bsz * cfg().nh * cfg().hd];
             {
                 let kcl: &[f32] = &kc[il];
                 let vcl: &[f32] = &vc[il];
                 let qs: &[f32] = &qkvs;
                 let out = SendPtr(aouts.as_mut_ptr());
-                par_rows(bsz * NH, |a, b2| {
+                par_rows(bsz * cfg().nh, |a, b2| {
                     for i in a..b2 {
-                        let b = i / NH;
-                        let h = i % NH;
+                        let b = i / cfg().nh;
+                        let h = i % cfg().nh;
                         let pos = pos0 + b;
-                        let start = if (il + 1) % 2 != 0 { pos.saturating_sub(SWA - 1) } else { 0 };
-                        let kvh = h / (NH / NKV);
-                        let qh = unsafe { qs.as_ptr().add(b * QKV + h * HD) };
+                        let start = if (il + 1) % 2 != 0 { pos.saturating_sub(cfg().swa - 1) } else { 0 };
+                        let kvh = h / (cfg().nh / cfg().nkv);
+                        let qh = unsafe { qs.as_ptr().add(b * qkvd + h * cfg().hd) };
                         let mut scores: Vec<f32> = (start..=pos)
                             .map(|t| unsafe {
-                                let kp = kcl.as_ptr().add((t * NKV + kvh) * HD);
+                                let kp = kcl.as_ptr().add((t * cfg().nkv + kvh) * cfg().hd);
                                 let mut a0 = vdupq_n_f32(0.0);
                                 let mut a1 = vdupq_n_f32(0.0);
                                 let mut a2 = vdupq_n_f32(0.0);
                                 let mut a3 = vdupq_n_f32(0.0);
                                 let mut j = 0;
-                                while j < HD {
+                                while j < cfg().hd {
                                     a0 = vfmaq_f32(a0, vld1q_f32(kp.add(j)), vld1q_f32(qh.add(j)));
                                     a1 = vfmaq_f32(a1, vld1q_f32(kp.add(j + 4)), vld1q_f32(qh.add(j + 4)));
                                     a2 = vfmaq_f32(a2, vld1q_f32(kp.add(j + 8)), vld1q_f32(qh.add(j + 8)));
@@ -920,7 +934,7 @@ fn main() {
                         unsafe {
                             let mut acc = [vdupq_n_f32(0.0); 16];
                             for (ti, t) in (start..=pos).enumerate() {
-                                let vp = vcl.as_ptr().add((t * NKV + kvh) * HD);
+                                let vp = vcl.as_ptr().add((t * cfg().nkv + kvh) * cfg().hd);
                                 let sv = scores[ti];
                                 for u in 0..16 {
                                     acc[u] = vfmaq_n_f32(acc[u], vld1q_f32(vp.add(u * 4)), sv);
@@ -928,7 +942,7 @@ fn main() {
                             }
                             let inv = 1.0 / denom;
                             for u in 0..16 {
-                                vst1q_f32(out.get().add(b * NH * HD + h * HD + u * 4), vmulq_n_f32(acc[u], inv));
+                                vst1q_f32(out.get().add(b * cfg().nh * cfg().hd + h * cfg().hd + u * 4), vmulq_n_f32(acc[u], inv));
                             }
                         }
                     }
@@ -936,12 +950,12 @@ fn main() {
             }
             {
                 let aq: Vec<(Vec<i8>, Vec<f32>)> =
-                    (0..bsz).map(|b| quant_i8(&aouts[b * NH * HD..(b + 1) * NH * HD])).collect();
+                    (0..bsz).map(|b| quant_i8(&aouts[b * cfg().nh * cfg().hd..(b + 1) * cfg().nh * cfg().hd])).collect();
                 let xps: Vec<SendPtr> = xs.iter_mut().map(|v| SendPtr(v.as_mut_ptr())).collect();
                 let (aq, xps) = (&aq, &xps);
                 for t0 in (0..bsz).step_by(TILE) {
                     let t1e = (t0 + TILE).min(bsz);
-                    par_rows(D, |a, b2| {
+                    par_rows(cfg().d, |a, b2| {
                         for r in a..b2 {
                             for b in t0..t1e {
                                 unsafe {
@@ -953,30 +967,30 @@ fn main() {
                 }
             }
             // ---- MoE FFN, expert-major batching ----
-            let mut tops = vec![[0usize; TOPK]; bsz];
-            let mut wtss = vec![[0f32; TOPK]; bsz];
+            let mut tops = vec![vec![0usize; cfg().topk]; bsz];
+            let mut wtss = vec![vec![0f32; cfg().topk]; bsz];
             let xn2q: Vec<(Vec<i8>, Vec<f32>)> = (0..bsz)
                 .map(|b| {
                     let xn2 = rmsnorm(&xs[b], &ly.ffn_norm);
-                    let logits: Vec<f32> = (0..NE)
+                    let logits: Vec<f32> = (0..cfg().ne)
                         .map(|e| {
                             let mut acc = ly.ginp_b[e];
-                            for j in 0..D {
-                                acc += ly.ginp[e * D + j] * xn2[j];
+                            for j in 0..cfg().d {
+                                acc += ly.ginp[e * cfg().d + j] * xn2[j];
                             }
                             acc
                         })
                         .collect();
-                    let mut order: Vec<usize> = (0..NE).collect();
+                    let mut order: Vec<usize> = (0..cfg().ne).collect();
                     order.sort_by(|&p1, &p2| logits[p2].partial_cmp(&logits[p1]).unwrap());
-                    let mx = (0..TOPK).map(|i| logits[order[i]]).fold(f32::MIN, f32::max);
+                    let mx = (0..cfg().topk).map(|i| logits[order[i]]).fold(f32::MIN, f32::max);
                     let mut sum = 0.0;
-                    let mut ws = [0f32; TOPK];
-                    for i in 0..TOPK {
+                    let mut ws = vec![0f32; cfg().topk];
+                    for i in 0..cfg().topk {
                         ws[i] = (logits[order[i]] - mx).exp();
                         sum += ws[i];
                     }
-                    for i in 0..TOPK {
+                    for i in 0..cfg().topk {
                         ws[i] /= sum;
                         tops[b][i] = order[i];
                     }
@@ -984,37 +998,37 @@ fn main() {
                     quant_i8(&xn2)
                 })
                 .collect();
-            let mut subs: Vec<Vec<(usize, usize)>> = vec![Vec::new(); NE];
+            let mut subs: Vec<Vec<(usize, usize)>> = vec![Vec::new(); cfg().ne];
             for b in 0..bsz {
-                for ei in 0..TOPK {
+                for ei in 0..cfg().topk {
                     subs[tops[b][ei]].push((b, ei));
                 }
             }
-            let active: Vec<usize> = (0..NE).filter(|&e| !subs[e].is_empty()).collect();
-            let mut gu = vec![0f32; bsz * TOPK * 2 * D];
+            let active: Vec<usize> = (0..cfg().ne).filter(|&e| !subs[e].is_empty()).collect();
+            let mut gu = vec![0f32; bsz * cfg().topk * 2 * cfg().d];
             {
                 let out = SendPtr(gu.as_mut_ptr());
                 let (subs, active, xn2q) = (&subs, &active, &xn2q);
                 for t0 in (0..bsz).step_by(TILE) {
                 let t1e = (t0 + TILE).min(bsz);
-                par_rows(active.len() * D, |a, b2| {
+                par_rows(active.len() * cfg().d, |a, b2| {
                     for it in a..b2 {
-                        let e = active[it / D];
-                        let rr = it % D;
+                        let e = active[it / cfg().d];
+                        let rr = it % cfg().d;
                         let qd = rr / 4;
                         if rr % 4 != 0 { continue; }
-                        let qg = e * (D / 4) + qd;
+                        let qg = e * (cfg().d / 4) + qd;
                         for &(b, ei) in subs[e].iter().filter(|&&(b, _)| b >= t0 && b < t1e) {
                             let gs = unsafe {
-                                dot4_mx_i8(ly.gate.nib.as_ptr().add(qg * BLOCKS * 64), ly.gate.scale.as_ptr().add(qg * BLOCKS * 4), xn2q[b].0.as_ptr(), xn2q[b].1.as_ptr())
+                                dot4_mx_i8(ly.gate.nib.as_ptr().add(qg * cfg().blocks * 64), ly.gate.scale.as_ptr().add(qg * cfg().blocks * 4), xn2q[b].0.as_ptr(), xn2q[b].1.as_ptr())
                             };
                             let us = unsafe {
-                                dot4_mx_i8(ly.up.nib.as_ptr().add(qg * BLOCKS * 64), ly.up.scale.as_ptr().add(qg * BLOCKS * 4), xn2q[b].0.as_ptr(), xn2q[b].1.as_ptr())
+                                dot4_mx_i8(ly.up.nib.as_ptr().add(qg * cfg().blocks * 64), ly.up.scale.as_ptr().add(qg * cfg().blocks * 4), xn2q[b].0.as_ptr(), xn2q[b].1.as_ptr())
                             };
                             for i in 0..4 {
                                 unsafe {
-                                    *out.get().add((b * TOPK + ei) * 2 * D + qd * 4 + i) = gs[i] + ly.gate_b[e * D + qd * 4 + i];
-                                    *out.get().add((b * TOPK + ei) * 2 * D + D + qd * 4 + i) = us[i] + ly.up_b[e * D + qd * 4 + i];
+                                    *out.get().add((b * cfg().topk + ei) * 2 * cfg().d + qd * 4 + i) = gs[i] + ly.gate_b[e * cfg().d + qd * 4 + i];
+                                    *out.get().add((b * cfg().topk + ei) * 2 * cfg().d + cfg().d + qd * 4 + i) = us[i] + ly.up_b[e * cfg().d + qd * 4 + i];
                                 }
                             }
                         }
@@ -1024,42 +1038,42 @@ fn main() {
             }
             const ALPHA: f32 = 1.702;
             const LIM: f32 = 7.0;
-            let mut hq = vec![0i8; bsz * TOPK * D];
-            let mut hsb = vec![0f32; bsz * TOPK * BLOCKS];
+            let mut hq = vec![0i8; bsz * cfg().topk * cfg().d];
+            let mut hsb = vec![0f32; bsz * cfg().topk * cfg().blocks];
             for b in 0..bsz {
-                for ei in 0..TOPK {
-                    let o = (b * TOPK + ei) * 2 * D;
-                    let hvec: Vec<f32> = (0..D)
+                for ei in 0..cfg().topk {
+                    let o = (b * cfg().topk + ei) * 2 * cfg().d;
+                    let hvec: Vec<f32> = (0..cfg().d)
                         .map(|k2| {
                             let xg = gu[o + k2].min(LIM);
-                            let yu = gu[o + D + k2].clamp(-LIM, LIM);
+                            let yu = gu[o + cfg().d + k2].clamp(-LIM, LIM);
                             (xg / (1.0 + (-ALPHA * xg).exp())) * (yu + 1.0)
                         })
                         .collect();
                     let (q8, s8) = quant_i8(&hvec);
-                    hq[(b * TOPK + ei) * D..(b * TOPK + ei + 1) * D].copy_from_slice(&q8);
-                    hsb[(b * TOPK + ei) * BLOCKS..(b * TOPK + ei + 1) * BLOCKS].copy_from_slice(&s8);
+                    hq[(b * cfg().topk + ei) * cfg().d..(b * cfg().topk + ei + 1) * cfg().d].copy_from_slice(&q8);
+                    hsb[(b * cfg().topk + ei) * cfg().blocks..(b * cfg().topk + ei + 1) * cfg().blocks].copy_from_slice(&s8);
                 }
             }
-            let mut ffn4 = vec![0f32; bsz * TOPK * D];
+            let mut ffn4 = vec![0f32; bsz * cfg().topk * cfg().d];
             {
                 let out = SendPtr(ffn4.as_mut_ptr());
                 let (subs, active, hq, hsb) = (&subs, &active, &hq, &hsb);
                 for t0 in (0..bsz).step_by(TILE) {
                 let t1e = (t0 + TILE).min(bsz);
-                par_rows(active.len() * D, |a, b2| {
+                par_rows(active.len() * cfg().d, |a, b2| {
                     for it in a..b2 {
-                        let e = active[it / D];
-                        let rr = it % D;
+                        let e = active[it / cfg().d];
+                        let rr = it % cfg().d;
                         let qd = rr / 4;
                         if rr % 4 != 0 { continue; }
-                        let qg = e * (D / 4) + qd;
+                        let qg = e * (cfg().d / 4) + qd;
                         for &(b, ei) in subs[e].iter().filter(|&&(b, _)| b >= t0 && b < t1e) {
                             let ds = unsafe {
-                                dot4_mx_i8(ly.down.nib.as_ptr().add(qg * BLOCKS * 64), ly.down.scale.as_ptr().add(qg * BLOCKS * 4), hq.as_ptr().add((b * TOPK + ei) * D), hsb.as_ptr().add((b * TOPK + ei) * BLOCKS))
+                                dot4_mx_i8(ly.down.nib.as_ptr().add(qg * cfg().blocks * 64), ly.down.scale.as_ptr().add(qg * cfg().blocks * 4), hq.as_ptr().add((b * cfg().topk + ei) * cfg().d), hsb.as_ptr().add((b * cfg().topk + ei) * cfg().blocks))
                             };
                             for i in 0..4 {
-                                unsafe { *out.get().add((b * TOPK + ei) * D + qd * 4 + i) = ds[i] + ly.down_b[e * D + qd * 4 + i] };
+                                unsafe { *out.get().add((b * cfg().topk + ei) * cfg().d + qd * 4 + i) = ds[i] + ly.down_b[e * cfg().d + qd * 4 + i] };
                             }
                         }
                     }
@@ -1067,10 +1081,10 @@ fn main() {
                 }
             }
             for b in 0..bsz {
-                for ei in 0..TOPK {
+                for ei in 0..cfg().topk {
                     let w = wtss[b][ei];
-                    for kx in 0..D {
-                        xs[b][kx] += w * ffn4[(b * TOPK + ei) * D + kx];
+                    for kx in 0..cfg().d {
+                        xs[b][kx] += w * ffn4[(b * cfg().topk + ei) * cfg().d + kx];
                     }
                 }
             }
@@ -1080,11 +1094,11 @@ fn main() {
         let mut best = vec![(f32::MIN, 0u32); NT];
         {
             let bp = best.as_mut_ptr() as usize;
-            let chunk = (NVOCAB + NT - 1) / NT;
+            let chunk = (cfg().nvocab + NT - 1) / NT;
             std::thread::scope(|sc| {
                 for t in 0..NT {
                     let a = t * chunk;
-                    let b2 = ((t + 1) * chunk).min(NVOCAB);
+                    let b2 = ((t + 1) * chunk).min(cfg().nvocab);
                     let (xq2, xs2, head) = (&xq2, &xs2, &head);
                     sc.spawn(move || {
                         let mut m = (f32::MIN, 0u32);

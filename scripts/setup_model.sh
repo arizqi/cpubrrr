@@ -56,6 +56,18 @@ def g(*suffixes, default=None):
         for s in suffixes:
             if k==f'{arch}.{s}' or k.endswith('.'+s): return v
     return default
+# n_vocab: metadata key is often absent; derive from token_embd/output tensor.
+n_vocab = g('vocab_size')
+if n_vocab is None:
+    for t in d['tensors']:
+        if t['name'] in ('token_embd.weight','output.weight'):
+            n_vocab = max(t['dims']); break
+# n_ff_exp: metadata or derive from an expert tensor (ggml dims = [n_embd, n_ff_exp, n_expert])
+n_ff_exp = g('expert_feed_forward_length')
+if n_ff_exp is None:
+    for t in d['tensors']:
+        if t['name'].endswith('ffn_gate_exps.weight'):
+            n_ff_exp = t['dims'][1]; break
 cfg={
   'arch': arch,
   'n_embd': g('embedding_length'),
@@ -65,10 +77,11 @@ cfg={
   'head_dim': g('attention.key_length'),
   'n_expert': g('expert_count'),
   'n_expert_used': g('expert_used_count'),
-  'n_ff_exp': g('expert_feed_forward_length'),
+  'n_ff_exp': n_ff_exp,
+  'sliding_window': g('attention.sliding_window'),
   'rope_freq_base': g('rope.freq_base'),
   'rms_eps': g('attention.layer_norm_rms_epsilon'),
-  'n_vocab': g('vocab_size'),
+  'n_vocab': n_vocab,
   'context_length': g('context_length'),
 }
 with open('$OUT/config.txt','w') as w:
