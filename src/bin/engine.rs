@@ -54,7 +54,7 @@ impl Drop for Tick {
 
 // ---------------- tensor access ----------------
 struct Model {
-    blob: Vec<u8>,
+    blob: memmap2::Mmap, // file-backed, evictable (avoids OOM on large models)
     idx: HashMap<String, (u32, usize, usize)>, // type, abs offset, nelems
 }
 impl Model {
@@ -515,9 +515,9 @@ fn main() {
     };
 
     // model
-    eprintln!("loading 13.8 GB blob...");
+    eprintln!("mmapping model blob...");
     let t0 = Instant::now();
-    let blob = fs::read(blobp).unwrap();
+    let blob = unsafe { memmap2::Mmap::map(&fs::File::open(blobp).unwrap()).unwrap() };
     let mut idx = HashMap::new();
     let man = fs::read_to_string(format!("{dir}/manifest.txt")).unwrap();
     let mut lines = man.lines();

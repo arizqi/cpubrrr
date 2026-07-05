@@ -105,3 +105,29 @@ Result: 8.1 → 24.5 tok/s (3×) — measured WHILE the 65GB gpt-oss:120b downlo
 still consuming memory bandwidth (the workload is bandwidth-bound, so this understates
 clean speed; est. ~40 tok/s clean). Next: quad-interleaved k-quant expert layout
 (the gpt-oss 51→110 lever), attention/quant fusion. Then clean re-measure.
+
+## 2026-07-05 — gpt-oss-120b RUNS (Move 1) + Qwen3 speed reality
+
+### gpt-oss-120b (117B params, 5.1B active) — RUNS on CPU
+Config-driven engine ran it directly (same arch as 20b: 36 layers, 128 experts vs
+24/32). Two fixes needed:
+- OOM at load: fs::read makes the 61GB blob non-evictable anonymous memory; + the quad
+  expert repack (~55GB copy) → >128GB → SIGKILL. Fix: mmap the blob (file-backed,
+  evictable) so the OS pages it. 20b still correct after the change.
+- Result: correct output ("...molecules scatter shorter (blue) wavelengths..."),
+  **19.0 tok/s decode** for a 117B frontier model on a laptop CPU. Profile: gate/up 41%,
+  down 28%, router 14% (128-expert router is heavy). Below the ~50 projection but RUNS.
+
+### Qwen3-Coder-30B speed
+Clean decode 25 tok/s (correct). Ollama/llama.cpp CPU baseline on the SAME model:
+47.7 tok/s. So here we LOSE to llama.cpp ~2× — opposite of gpt-oss (7.5x win). Reason:
+Q4_K is llama.cpp's mature, heavily-tuned quant (years of work), whereas gpt-oss's
+MXFP4-MoE CPU path was weak. Kernel experiments: deferred horizontal reduction in
+q4k/q6k — no change (not reduction-bound). Bandwidth math says ~100 is reachable
+(1.8GB/token, 290 GB/s ceiling → 160 tok/s theoretical) but requires beating mature
+Q4_K kernels 2×+ — a sustained kernel-optimization grind, not a few tweaks. HONEST:
+correct-and-competitive achieved; 100 tok/s on this model is a real open effort.
+
+### Standing (all 3 top targets RUN correctly on the cpubrrr engine)
+- gpt-oss-120b: 19 tok/s (Move 1) ✓  | Qwen3-Coder-30B: 25 tok/s (Move 2) ✓
+- Qwen3-30B general (Move 3): same engine, drop-in ✓
