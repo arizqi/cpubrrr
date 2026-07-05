@@ -64,7 +64,7 @@ unsafe fn sdot(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
 unsafe fn q4k_dot(row: *const u8, xq: *const i8, xs: *const f32, xsum: *const i32, cols: usize) -> f32 {
     unsafe {
         let mask = vdupq_n_u8(0x0F);
-        let mut f = [vdupq_n_f32(0.0); 2];
+        let mut f = [vdupq_n_f32(0.0); 4];
         let mut minacc = 0f32;
         for sb in 0..cols / 256 {
             let b = row.add(sb * 144);
@@ -91,12 +91,12 @@ unsafe fn q4k_dot(row: *const u8, xq: *const i8, xs: *const f32, xsum: *const i3
                 minacc += xs0 * dm[j0] * *xsum.add(blk0) as f32 + xs1 * dm[j1] * *xsum.add(blk1) as f32;
             }
         }
-        vaddvq_f32(vaddq_f32(f[0], f[1])) - minacc
+        vaddvq_f32(vaddq_f32(vaddq_f32(f[0], f[1]), vaddq_f32(f[2], f[3]))) - minacc
     }
 }
 unsafe fn q6k_dot(row: *const u8, xq: *const i8, xs: *const f32, cols: usize) -> f32 {
     unsafe {
-        let mut f = [vdupq_n_f32(0.0); 2];
+        let mut f = [vdupq_n_f32(0.0); 4];
         for sb in 0..cols / 256 {
             let b = row.add(sb * 210);
             let (ql, qh, sc) = (b, b.add(128), b.add(192));
@@ -124,10 +124,10 @@ unsafe fn q6k_dot(row: *const u8, xq: *const i8, xs: *const f32, cols: usize) ->
             for s16 in 0..16 {
                 let blk = sb * 8 + s16 / 2;
                 let sd = sdot(vdupq_n_s32(0), vld1q_s8(t.as_ptr().add(s16 * 16)), vld1q_s8(xq.add(blk * 32 + (s16 % 2) * 16)));
-                f[s16 & 1] = vfmaq_n_f32(f[s16 & 1], vcvtq_f32_s32(sd), *xs.add(blk) * d * (*sc.add(s16) as i8 as f32));
+                f[s16 & 3] = vfmaq_n_f32(f[s16 & 3], vcvtq_f32_s32(sd), *xs.add(blk) * d * (*sc.add(s16) as i8 as f32));
             }
         }
-        vaddvq_f32(vaddq_f32(f[0], f[1]))
+        vaddvq_f32(vaddq_f32(vaddq_f32(f[0], f[1]), vaddq_f32(f[2], f[3])))
     }
 }
 
