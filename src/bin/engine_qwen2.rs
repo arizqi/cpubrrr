@@ -94,6 +94,47 @@ unsafe fn q4k_dot(row: *const u8, xq: *const i8, xs: *const f32, xsum: *const i3
         vaddvq_f32(vaddq_f32(vaddq_f32(f[0], f[1]), vaddq_f32(f[2], f[3]))) - minacc
     }
 }
+/// Fused gate+up Q4_K: shared xq loads, 2 independent weight streams (ILP). -> (gate, up)
+unsafe fn q4k_gu(g: *const u8, u: *const u8, xq: *const i8, xs: *const f32, xsum: *const i32, cols: usize) -> (f32, f32) {
+    unsafe {
+        let mask = vdupq_n_u8(0x0F);
+        let mut fg = [vdupq_n_f32(0.0); 2];
+        let mut fu = [vdupq_n_f32(0.0); 2];
+        let (mut mg, mut mu) = (0f32, 0f32);
+        for sb in 0..cols / 256 {
+            let gb = g.add(sb * 144); let ub = u.add(sb * 144);
+            let gd = half_to_f32(u16::from_le_bytes([*gb, *gb.add(1)])); let gdm = half_to_f32(u16::from_le_bytes([*gb.add(2), *gb.add(3)]));
+            let ud = half_to_f32(u16::from_le_bytes([*ub, *ub.add(1)])); let udm = half_to_f32(u16::from_le_bytes([*ub.add(2), *ub.add(3)]));
+            let gsc = std::slice::from_raw_parts(gb.add(4), 12); let usc = std::slice::from_raw_parts(ub.add(4), 12);
+            let (gqs, uqs) = (gb.add(16), ub.add(16));
+            for jj in 0..4 {
+                let (j0, j1) = (jj * 2, jj * 2 + 1);
+                let (blk0, blk1) = (sb * 8 + j0, sb * 8 + j1);
+                let x0a = vld1q_s8(xq.add(blk0 * 32)); let x0b = vld1q_s8(xq.add(blk0 * 32 + 16));
+                let x1a = vld1q_s8(xq.add(blk1 * 32)); let x1b = vld1q_s8(xq.add(blk1 * 32 + 16));
+                let (xs0, xs1) = (*xs.add(blk0), *xs.add(blk1));
+                let (xm0, xm1) = (*xsum.add(blk0) as f32, *xsum.add(blk1) as f32);
+                // gate
+                let (gs0, gm0) = scale_min_k4(j0, gsc); let (gs1, gm1) = scale_min_k4(j1, gsc);
+                let gw0 = vld1q_u8(gqs.add(jj * 32)); let gw1 = vld1q_u8(gqs.add(jj * 32 + 16));
+                let gd0 = sdot(sdot(vdupq_n_s32(0), vreinterpretq_s8_u8(vandq_u8(gw0, mask)), x0a), vreinterpretq_s8_u8(vandq_u8(gw1, mask)), x0b);
+                let gd1 = sdot(sdot(vdupq_n_s32(0), vreinterpretq_s8_u8(vshrq_n_u8::<4>(gw0)), x1a), vreinterpretq_s8_u8(vshrq_n_u8::<4>(gw1)), x1b);
+                fg[0] = vfmaq_n_f32(fg[0], vcvtq_f32_s32(gd0), xs0 * gd * gs0 as f32);
+                fg[1] = vfmaq_n_f32(fg[1], vcvtq_f32_s32(gd1), xs1 * gd * gs1 as f32);
+                mg += xs0 * gdm * gm0 as f32 * xm0 + xs1 * gdm * gm1 as f32 * xm1;
+                // up
+                let (us0, um0) = scale_min_k4(j0, usc); let (us1, um1) = scale_min_k4(j1, usc);
+                let uw0 = vld1q_u8(uqs.add(jj * 32)); let uw1 = vld1q_u8(uqs.add(jj * 32 + 16));
+                let ud0 = sdot(sdot(vdupq_n_s32(0), vreinterpretq_s8_u8(vandq_u8(uw0, mask)), x0a), vreinterpretq_s8_u8(vandq_u8(uw1, mask)), x0b);
+                let ud1 = sdot(sdot(vdupq_n_s32(0), vreinterpretq_s8_u8(vshrq_n_u8::<4>(uw0)), x1a), vreinterpretq_s8_u8(vshrq_n_u8::<4>(uw1)), x1b);
+                fu[0] = vfmaq_n_f32(fu[0], vcvtq_f32_s32(ud0), xs0 * ud * us0 as f32);
+                fu[1] = vfmaq_n_f32(fu[1], vcvtq_f32_s32(ud1), xs1 * ud * us1 as f32);
+                mu += xs0 * udm * um0 as f32 * xm0 + xs1 * udm * um1 as f32 * xm1;
+            }
+        }
+        (vaddvq_f32(vaddq_f32(fg[0], fg[1])) - mg, vaddvq_f32(vaddq_f32(fu[0], fu[1])) - mu)
+    }
+}
 unsafe fn q6k_dot(row: *const u8, xq: *const i8, xs: *const f32, cols: usize) -> f32 {
     unsafe {
         let mut f = [vdupq_n_f32(0.0); 4];
@@ -318,8 +359,7 @@ fn forward_worker(sh: &Shared, wid: usize, ls: &mut bool) {
             // gate/up/silu (parallel over topk*ff)
             { let (a, b) = sl(wid, topk * ff);
               for it in a..b { let (ei, r) = (it / ff, it % ff); let gr = top[ei] * ff + r;
-                let g = ly.gate.dot(gr, sh.xq, sh.xs, sh.xsum);
-                let u = ly.up.dot(gr, sh.xq, sh.xs, sh.xsum);
+                let (g, u) = q4k_gu(ly.gate.ptr.add(gr * ly.gate.bpr), ly.up.ptr.add(gr * ly.up.bpr), sh.xq, sh.xs, sh.xsum, ly.gate.cols);
                 *sh.hbuf.add(it) = (g / (1.0 + (-g).exp())) * u; } }
             bar(sh, ls);
             if let Some(t)=_tg { TM[1].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
@@ -327,12 +367,14 @@ fn forward_worker(sh: &Shared, wid: usize, ls: &mut bool) {
             // quant hbuf per expert (parallel over topk*ff/32 blocks)
             { let (a, b) = sl(wid, topk * ff / 32); for bl in a..b { qblock(sh.hbuf, sh.hq, sh.hs, sh.hm, bl); } }
             bar(sh, ls);
-            // down + weighted accumulate (parallel over d output dims)
+            // down + weighted accumulate (expert-major for sequential row streaming)
             { let (a, b) = sl(wid, d);
-              for r in a..b { let mut acc = 0f32;
-                for ei in 0..topk { let dr = top[ei] * d + r;
-                    acc += wts[ei] * ly.down.dot(dr, sh.hq.add(ei * ff), sh.hs.add(ei * (ff / 32)), sh.hm.add(ei * (ff / 32))); }
-                *sh.x.add(r) += acc; } }
+              for r in a..b { *sh.x.add(r) += 0.0; } // no-op; accumulate below
+              for ei in 0..topk {
+                let (hq, hs, hm) = (sh.hq.add(ei * ff), sh.hs.add(ei * (ff / 32)), sh.hm.add(ei * (ff / 32)));
+                let w = wts[ei]; let base = top[ei] * d;
+                for r in a..b { *sh.x.add(r) += w * ly.down.dot(base + r, hq, hs, hm); }
+              } }
             bar(sh, ls);
             if let Some(t)=_td { TM[2].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
         }
