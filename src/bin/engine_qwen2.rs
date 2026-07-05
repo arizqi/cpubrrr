@@ -14,6 +14,7 @@ use std::time::Instant;
 
 const NT: usize = 12;
 const MAXSEQ: usize = 4096;
+static TM: [AtomicU64; 5] = [AtomicU64::new(0),AtomicU64::new(0),AtomicU64::new(0),AtomicU64::new(0),AtomicU64::new(0)];
 
 #[derive(Clone, Copy)]
 struct Cfg { d: usize, nh: usize, nkv: usize, hd: usize, nl: usize, ne: usize, topk: usize,
@@ -71,10 +72,11 @@ unsafe fn q4k_dot(row: *const u8, xq: *const i8, xs: *const f32, xsum: *const i3
             let dmin = half_to_f32(u16::from_le_bytes([*b.add(2), *b.add(3)]));
             let scales = std::slice::from_raw_parts(b.add(4), 12);
             let qs = b.add(16);
+            // precompute 8 (d*sc, dmin*m) once per superblock (hoist branchy extraction)
+            let mut dsc = [0f32; 8]; let mut dm = [0f32; 8];
+            for j in 0..8 { let (sc, m) = scale_min_k4(j, scales); dsc[j] = d * sc as f32; dm[j] = dmin * m as f32; }
             for jj in 0..4 {
                 let (j0, j1) = (jj * 2, jj * 2 + 1);
-                let (sc0, m0) = scale_min_k4(j0, scales);
-                let (sc1, m1) = scale_min_k4(j1, scales);
                 let (blk0, blk1) = (sb * 8 + j0, sb * 8 + j1);
                 let qb = qs.add(jj * 32);
                 let w0 = vld1q_u8(qb);
@@ -84,9 +86,9 @@ unsafe fn q4k_dot(row: *const u8, xq: *const i8, xs: *const f32, xsum: *const i3
                 let s1 = sdot(sdot(vdupq_n_s32(0), vreinterpretq_s8_u8(vshrq_n_u8::<4>(w0)), vld1q_s8(xq.add(blk1 * 32))),
                               vreinterpretq_s8_u8(vshrq_n_u8::<4>(w1)), vld1q_s8(xq.add(blk1 * 32 + 16)));
                 let (xs0, xs1) = (*xs.add(blk0), *xs.add(blk1));
-                f[0] = vfmaq_n_f32(f[0], vcvtq_f32_s32(s0), xs0 * d * sc0 as f32);
-                f[1] = vfmaq_n_f32(f[1], vcvtq_f32_s32(s1), xs1 * d * sc1 as f32);
-                minacc += xs0 * dmin * m0 as f32 * *xsum.add(blk0) as f32 + xs1 * dmin * m1 as f32 * *xsum.add(blk1) as f32;
+                f[0] = vfmaq_n_f32(f[0], vcvtq_f32_s32(s0), xs0 * dsc[j0]);
+                f[1] = vfmaq_n_f32(f[1], vcvtq_f32_s32(s1), xs1 * dsc[j1]);
+                minacc += xs0 * dm[j0] * *xsum.add(blk0) as f32 + xs1 * dm[j1] * *xsum.add(blk1) as f32;
             }
         }
         vaddvq_f32(vaddq_f32(f[0], f[1])) - minacc
@@ -100,14 +102,23 @@ unsafe fn q6k_dot(row: *const u8, xq: *const i8, xs: *const f32, cols: usize) ->
             let (ql, qh, sc) = (b, b.add(128), b.add(192));
             let d = half_to_f32(u16::from_le_bytes([*b.add(208), *b.add(209)]));
             let mut t = [0i8; 256];
+            let m0f = vdupq_n_u8(0x0F); let m3 = vdupq_n_u8(0x03); let n32 = vdupq_n_s8(32);
             for h in 0..2 {
                 let (qlh, qhh) = (ql.add(h * 64), qh.add(h * 32));
-                for l in 0..32 {
-                    let (a, a32, ah) = (*qlh.add(l), *qlh.add(l + 32), *qhh.add(l));
-                    t[h * 128 + l] = (((a & 0xF) | (((ah >> 0) & 3) << 4)) as i8) - 32;
-                    t[h * 128 + l + 32] = (((a32 & 0xF) | (((ah >> 2) & 3) << 4)) as i8) - 32;
-                    t[h * 128 + l + 64] = (((a >> 4) | (((ah >> 4) & 3) << 4)) as i8) - 32;
-                    t[h * 128 + l + 96] = (((a32 >> 4) | (((ah >> 6) & 3) << 4)) as i8) - 32;
+                let tb = t.as_mut_ptr().add(h * 128);
+                for l16 in 0..2 {
+                    let off = l16 * 16;
+                    let qla = vld1q_u8(qlh.add(off));
+                    let qlb = vld1q_u8(qlh.add(off + 32));
+                    let qhv = vld1q_u8(qhh.add(off));
+                    let h0 = vshlq_n_u8::<4>(vandq_u8(qhv, m3));
+                    let h1 = vshlq_n_u8::<4>(vandq_u8(vshrq_n_u8::<2>(qhv), m3));
+                    let h2 = vshlq_n_u8::<4>(vandq_u8(vshrq_n_u8::<4>(qhv), m3));
+                    let h3 = vshlq_n_u8::<4>(vshrq_n_u8::<6>(qhv));
+                    vst1q_s8(tb.add(off), vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(qla, m0f), h0)), n32));
+                    vst1q_s8(tb.add(off + 32), vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(qlb, m0f), h1)), n32));
+                    vst1q_s8(tb.add(off + 64), vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(qla), h2)), n32));
+                    vst1q_s8(tb.add(off + 96), vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(qlb), h3)), n32));
                 }
             }
             for s16 in 0..16 {
@@ -274,10 +285,10 @@ fn forward_worker(sh: &Shared, wid: usize, ls: &mut bool) {
             { let scale = 1.0 / (hd as f32).sqrt(); let (a, b) = sl(wid, nh);
               for h in a..b {
                 let kvh = h / (nh / nkv);
-                let mut sc = vec![0f32; pos + 1];
+                let mut sc = [0f32; MAXSEQ];
                 for t in 0..=pos { let mut acc = 0.0; for j in 0..hd { acc += *kcl.add((t * nkv + kvh) * hd + j) * *sh.q.add(h * hd + j); } sc[t] = acc * scale; }
-                let mx = sc.iter().cloned().fold(f32::MIN, f32::max);
-                let mut den = 0.0; for s in sc.iter_mut() { *s = (*s - mx).exp(); den += *s; }
+                let mx = sc[..=pos].iter().cloned().fold(f32::MIN, f32::max);
+                let mut den = 0.0; for t in 0..=pos { sc[t] = (sc[t] - mx).exp(); den += sc[t]; }
                 for j in 0..hd { let mut acc = 0.0; for t in 0..=pos { acc += sc[t] * *vcl.add((t * nkv + kvh) * hd + j); } *sh.ao.add(h * hd + j) = acc / den; }
               } }
             bar(sh, ls);
@@ -303,6 +314,7 @@ fn forward_worker(sh: &Shared, wid: usize, ls: &mut bool) {
             for i in 0..topk { ex[i] = (logits[order[i]] - lmax).exp(); wsum += ex[i]; }
             let top: Vec<usize> = order[..topk].to_vec();
             let wts: Vec<f32> = (0..topk).map(|i| ex[i] / wsum).collect();
+            let _tg = if wid==0 { Some(Instant::now()) } else { None };
             // gate/up/silu (parallel over topk*ff)
             { let (a, b) = sl(wid, topk * ff);
               for it in a..b { let (ei, r) = (it / ff, it % ff); let gr = top[ei] * ff + r;
@@ -310,6 +322,8 @@ fn forward_worker(sh: &Shared, wid: usize, ls: &mut bool) {
                 let u = ly.up.dot(gr, sh.xq, sh.xs, sh.xsum);
                 *sh.hbuf.add(it) = (g / (1.0 + (-g).exp())) * u; } }
             bar(sh, ls);
+            if let Some(t)=_tg { TM[1].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
+            let _td = if wid==0 { Some(Instant::now()) } else { None };
             // quant hbuf per expert (parallel over topk*ff/32 blocks)
             { let (a, b) = sl(wid, topk * ff / 32); for bl in a..b { qblock(sh.hbuf, sh.hq, sh.hs, sh.hm, bl); } }
             bar(sh, ls);
@@ -320,7 +334,9 @@ fn forward_worker(sh: &Shared, wid: usize, ls: &mut bool) {
                     acc += wts[ei] * ly.down.dot(dr, sh.hq.add(ei * ff), sh.hs.add(ei * (ff / 32)), sh.hm.add(ei * (ff / 32))); }
                 *sh.x.add(r) += acc; } }
             bar(sh, ls);
+            if let Some(t)=_td { TM[2].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
         }
+        let _th = if wid==0 { Some(Instant::now()) } else { None };
         // ---- head ----
         rmsnorm_par(sh, wid, ls, sh.x, sh.xn, sh.out_norm.as_ptr(), d);
         { let (a, b) = sl(wid, nb); for bl in a..b { qblock(sh.xn, sh.xq, sh.xs, sh.xsum, bl); } }
@@ -334,6 +350,7 @@ fn forward_worker(sh: &Shared, wid: usize, ls: &mut bool) {
             for w in 0..NT { let v = *sh.apart.add(w); let sc = f32::from_bits((v >> 32) as u32); let id = v as u32; if sc > best.0 { best = (sc, id); } }
             sh.result.store(best.1, Ordering::Relaxed);
         }
+        if let Some(t)=_th { TM[3].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
     }
 }
 
@@ -487,4 +504,6 @@ fn main() {
     }
     let dt = t2.elapsed().as_secs_f64();
     println!("\n---\ndecode: {n} tokens in {dt:.2}s = {:.1} tok/s", n as f64 / dt);
+    let nm=["","gate/up","down","head",""];
+    for i in [1,2,3] { println!("  {:<8} {:.2} ms/tok", nm[i], TM[i].load(Ordering::Relaxed) as f64/1e6/n as f64); }
 }
