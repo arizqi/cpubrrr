@@ -191,3 +191,39 @@ Beating llama.cpp (47.7) / reaching 100 requires a DIFFERENT model — dependenc
 persistent scheduling with minimal sync, or sequence batching — not incremental tuning.
 Spin-based barrier reduction is counterproductive here (proven twice). Correct + stable
 at 30 tok/s; 100 needs an execution-model rewrite, scoped but out of incremental reach.
+
+## 2026-07-05 — REWRITE: worker-driven engine v2 (30 → 65.5 tok/s, beats llama.cpp)
+
+engine_qwen2.rs: complete execution-model rewrite. 12 persistent workers run the ENTIRE
+forward pass themselves with sense-reversing spin-barriers (~1us, all arrive together),
+parking only ONCE per token. ALL glue (rmsnorm, quant, router) parallelized. This
+eliminated the fork-join barrier tax (337 barriers × 35us wakeup = 12ms).
+
+Optimization ladder (each measured, correct throughout — verified vs Ollama):
+| change | tok/s | note |
+|---|---|---|
+| worker-driven, main spins | 20.6 | oversubscribed (main steals a core) |
+| main parks (frees core) | 36.7 | |
+| balanced split + QoS P-core pin | 42.5 | ceil-div left last worker empty |
+| q4k scale-hoist + attn stack buf | 43.3 | |
+| **vectorize Q6_K reconstruct (NEON)** | **60.4** | biggest single win — Q6_K was 64% of time |
+| 4 accumulators in kernels | 62.6 | |
+| down expert-major (sequential) | 62.9 | |
+| fused gate+up kernel | 64.5 | |
+| NEON attention loops | **65.5** | |
+
+**Result: 65.5 tok/s vs llama.cpp 47.7 — we WIN on Qwen3-Coder by 1.37x** (correct
+output on all test prompts). The rewrite's premise held: eliminate barriers → saturate
+12 cores (measured ~11.9/12) → become kernel-bound → optimize kernels.
+
+### Why not 100 — the quality ceiling (measured, definitive)
+At 65.5 we run ~98 GB/s aggregate; our gpt-oss int4 kernel hit 228. The gap is Q4_K's
+per-sub-block scale+MIN unpacking (asymmetric quant). Converting Q4_K -> the simple
+symmetric int4-quad layout (which enabled 228 GB/s) was TESTED for quality:
+- symmetric int8 per-32: rel L2 err 0.5-0.7% (safe) but 2x bytes -> ~76 tok/s, marginal
+- symmetric int4 per-32: rel L2 err **8.6-13.2%** -> would wreck the coding model
+So 100 tok/s on Qwen3-Coder requires lossy quant that degrades quality — not acceptable.
+65.5 is the quality-preserving ceiling for correct Q4_K/Q6_K decode on NEON. (gpt-oss hit
+110 because MXFP4 is symmetric — no min to unpack.) Honest stop: we beat the mature
+baseline 1.37x with the rewrite; exactly-100 needs either a symmetric-quant model or SME
+(which doesn't fit single-vector GEMV).
