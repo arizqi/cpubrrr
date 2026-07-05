@@ -299,6 +299,7 @@ fn forward_worker(sh: &Shared, wid: usize, ls: &mut bool) {
             let ly = &sh.layers[il];
             let kcl = sh.kc.add(il * MAXSEQ * nkv * hd);
             let vcl = sh.vc.add(il * MAXSEQ * nkv * hd);
+            let _ta = if wid==0 { Some(Instant::now()) } else { None };
             // ---- attn rmsnorm: parallel reduction then normalize ----
             rmsnorm_par(sh, wid, ls, sh.x, sh.xn, ly.attn_norm.as_ptr(), d);
             // quant xn
@@ -327,10 +328,23 @@ fn forward_worker(sh: &Shared, wid: usize, ls: &mut bool) {
               for h in a..b {
                 let kvh = h / (nh / nkv);
                 let mut sc = [0f32; MAXSEQ];
-                for t in 0..=pos { let mut acc = 0.0; for j in 0..hd { acc += *kcl.add((t * nkv + kvh) * hd + j) * *sh.q.add(h * hd + j); } sc[t] = acc * scale; }
+                let qh = sh.q.add(h * hd);
+                for t in 0..=pos {
+                    let kp = kcl.add((t * nkv + kvh) * hd);
+                    let mut a0 = vdupq_n_f32(0.0); let mut a1 = vdupq_n_f32(0.0);
+                    let mut j = 0; while j < hd { a0 = vfmaq_f32(a0, vld1q_f32(kp.add(j)), vld1q_f32(qh.add(j))); a1 = vfmaq_f32(a1, vld1q_f32(kp.add(j + 4)), vld1q_f32(qh.add(j + 4))); j += 8; }
+                    sc[t] = vaddvq_f32(vaddq_f32(a0, a1)) * scale;
+                }
                 let mx = sc[..=pos].iter().cloned().fold(f32::MIN, f32::max);
                 let mut den = 0.0; for t in 0..=pos { sc[t] = (sc[t] - mx).exp(); den += sc[t]; }
-                for j in 0..hd { let mut acc = 0.0; for t in 0..=pos { acc += sc[t] * *vcl.add((t * nkv + kvh) * hd + j); } *sh.ao.add(h * hd + j) = acc / den; }
+                let inv = 1.0 / den;
+                let aop = sh.ao.add(h * hd);
+                for jb in 0..hd / 4 { vst1q_f32(aop.add(jb * 4), vdupq_n_f32(0.0)); }
+                for t in 0..=pos {
+                    let vp = vcl.add((t * nkv + kvh) * hd); let sct = sc[t];
+                    for jb in 0..hd / 4 { let o = aop.add(jb * 4); vst1q_f32(o, vfmaq_n_f32(vld1q_f32(o), vld1q_f32(vp.add(jb * 4)), sct)); }
+                }
+                for j in 0..hd { *aop.add(j) *= inv; }
               } }
             bar(sh, ls);
             // quant ao
@@ -339,6 +353,8 @@ fn forward_worker(sh: &Shared, wid: usize, ls: &mut bool) {
             // o-proj + residual
             { let (a, b) = sl(wid, d); for r in a..b { *sh.x.add(r) += ly.wo.dot(r, sh.aq, sh.asc, sh.asm); } }
             bar(sh, ls);
+            if let Some(t)=_ta { TM[0].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
+            let _tr = if wid==0 { Some(Instant::now()) } else { None };
             // ffn rmsnorm
             rmsnorm_par(sh, wid, ls, sh.x, sh.xn, ly.ffn_norm.as_ptr(), d);
             { let (a, b) = sl(wid, nb); for bl in a..b { qblock(sh.xn, sh.xq, sh.xs, sh.xsum, bl); } }
@@ -355,6 +371,7 @@ fn forward_worker(sh: &Shared, wid: usize, ls: &mut bool) {
             for i in 0..topk { ex[i] = (logits[order[i]] - lmax).exp(); wsum += ex[i]; }
             let top: Vec<usize> = order[..topk].to_vec();
             let wts: Vec<f32> = (0..topk).map(|i| ex[i] / wsum).collect();
+            if let Some(t)=_tr { TM[4].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
             let _tg = if wid==0 { Some(Instant::now()) } else { None };
             // gate/up/silu (parallel over topk*ff)
             { let (a, b) = sl(wid, topk * ff);
@@ -546,6 +563,6 @@ fn main() {
     }
     let dt = t2.elapsed().as_secs_f64();
     println!("\n---\ndecode: {n} tokens in {dt:.2}s = {:.1} tok/s", n as f64 / dt);
-    let nm=["","gate/up","down","head",""];
-    for i in [1,2,3] { println!("  {:<8} {:.2} ms/tok", nm[i], TM[i].load(Ordering::Relaxed) as f64/1e6/n as f64); }
+    let nm=["attn-blk","gate/up","down","head","ffnorm+rtr"];
+    for i in [0,4,1,2,3] { println!("  {:<10} {:.2} ms/tok", nm[i], TM[i].load(Ordering::Relaxed) as f64/1e6/n as f64); }
 }
