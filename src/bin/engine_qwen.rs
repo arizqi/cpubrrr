@@ -61,7 +61,8 @@ unsafe fn sdot(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
 unsafe fn q4k_dot(row: *const u8, xq: *const i8, xs: *const f32, xsum: *const i32, cols: usize) -> f32 {
     unsafe {
         let mask = vdupq_n_u8(0x0F);
-        let mut acc = 0f32;
+        let mut facc = vdupq_n_f32(0.0);   // deferred: accumulate scale*sdot lanes, one reduce at end
+        let mut minacc = 0f32;
         for sb in 0..cols / 256 {
             let b = row.add(sb * 144);
             let d = half_to_f32(u16::from_le_bytes([*b, *b.add(1)]));
@@ -78,15 +79,17 @@ unsafe fn q4k_dot(row: *const u8, xq: *const i8, xs: *const f32, xsum: *const i3
                     else { (vshrq_n_u8::<4>(w0), vshrq_n_u8::<4>(w1)) };
                 let s = sdot(sdot(vdupq_n_s32(0), vreinterpretq_s8_u8(n0), vld1q_s8(xq.add(blk * 32))),
                              vreinterpretq_s8_u8(n1), vld1q_s8(xq.add(blk * 32 + 16)));
-                acc += *xs.add(blk) * (d * sc as f32 * vaddvq_s32(s) as f32 - dmin * m as f32 * *xsum.add(blk) as f32);
+                let xsb = *xs.add(blk);
+                facc = vfmaq_n_f32(facc, vcvtq_f32_s32(s), xsb * d * sc as f32);
+                minacc += xsb * dmin * m as f32 * *xsum.add(blk) as f32;
             }
         }
-        acc
+        vaddvq_f32(facc) - minacc
     }
 }
 unsafe fn q6k_dot(row: *const u8, xq: *const i8, xs: *const f32, cols: usize) -> f32 {
     unsafe {
-        let mut acc = 0f32;
+        let mut facc = vdupq_n_f32(0.0);
         for sb in 0..cols / 256 {
             let b = row.add(sb * 210);
             let (ql, qh, sc) = (b, b.add(128), b.add(192));
@@ -104,12 +107,12 @@ unsafe fn q6k_dot(row: *const u8, xq: *const i8, xs: *const f32, cols: usize) ->
             }
             for s16 in 0..16 {
                 let blk = sb * 8 + s16 / 2;
-                let sm = vaddvq_s32(sdot(vdupq_n_s32(0), vld1q_s8(t.as_ptr().add(s16 * 16)),
-                    vld1q_s8(xq.add(blk * 32 + (s16 % 2) * 16)))) as f32;
-                acc += *xs.add(blk) * d * (*sc.add(s16) as i8 as f32) * sm;
+                let sd = sdot(vdupq_n_s32(0), vld1q_s8(t.as_ptr().add(s16 * 16)),
+                    vld1q_s8(xq.add(blk * 32 + (s16 % 2) * 16)));
+                facc = vfmaq_n_f32(facc, vcvtq_f32_s32(sd), *xs.add(blk) * d * (*sc.add(s16) as i8 as f32));
             }
         }
-        acc
+        vaddvq_f32(facc)
     }
 }
 
@@ -448,4 +451,5 @@ fn main() {
     }
     let dt = t2.elapsed().as_secs_f64();
     println!("\n---\ndecode: {n} tokens in {dt:.2}s = {:.1} tok/s", n as f64 / dt);
+
 }
