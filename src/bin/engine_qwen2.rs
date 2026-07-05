@@ -52,6 +52,24 @@ fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
     if j < 4 { (q[j] & 63, q[j + 4] & 63) }
     else { ((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4), (q[j + 4] >> 4) | ((q[j] >> 6) << 4)) }
 }
+/// Unpack all 8 Q4_K scales+mins at once (llama.cpp u32 trick) instead of 8 branchy calls.
+#[inline(always)]
+unsafe fn unpack_k4(scales: *const u8) -> ([u8; 8], [u8; 8]) {
+    unsafe {
+        let mut u = [0u32; 4];
+        std::ptr::copy_nonoverlapping(scales, u.as_mut_ptr() as *mut u8, 12);
+        let (k1, k2, k3) = (0x3f3f3f3fu32, 0x0f0f0f0fu32, 0x03030303u32);
+        u[3] = ((u[2] >> 4) & k2) | (((u[1] >> 6) & k3) << 4);
+        let uaux = u[1] & k1;
+        u[1] = (u[2] & k2) | (((u[0] >> 6) & k3) << 4);
+        u[2] = uaux;
+        u[0] &= k1;
+        let mut sc = [0u8; 8]; let mut m = [0u8; 8];
+        std::ptr::copy_nonoverlapping(u.as_ptr() as *const u8, sc.as_mut_ptr(), 8);
+        std::ptr::copy_nonoverlapping((u.as_ptr() as *const u8).add(8), m.as_mut_ptr(), 8);
+        (sc, m)
+    }
+}
 #[inline(always)]
 unsafe fn sdot(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
     unsafe {
@@ -105,7 +123,7 @@ unsafe fn q4k_gu(g: *const u8, u: *const u8, xq: *const i8, xs: *const f32, xsum
             let gb = g.add(sb * 144); let ub = u.add(sb * 144);
             let gd = half_to_f32(u16::from_le_bytes([*gb, *gb.add(1)])); let gdm = half_to_f32(u16::from_le_bytes([*gb.add(2), *gb.add(3)]));
             let ud = half_to_f32(u16::from_le_bytes([*ub, *ub.add(1)])); let udm = half_to_f32(u16::from_le_bytes([*ub.add(2), *ub.add(3)]));
-            let gsc = std::slice::from_raw_parts(gb.add(4), 12); let usc = std::slice::from_raw_parts(ub.add(4), 12);
+            let (gscv, gmv) = unpack_k4(gb.add(4)); let (uscv, umv) = unpack_k4(ub.add(4));
             let (gqs, uqs) = (gb.add(16), ub.add(16));
             for jj in 0..4 {
                 let (j0, j1) = (jj * 2, jj * 2 + 1);
@@ -115,7 +133,7 @@ unsafe fn q4k_gu(g: *const u8, u: *const u8, xq: *const i8, xs: *const f32, xsum
                 let (xs0, xs1) = (*xs.add(blk0), *xs.add(blk1));
                 let (xm0, xm1) = (*xsum.add(blk0) as f32, *xsum.add(blk1) as f32);
                 // gate
-                let (gs0, gm0) = scale_min_k4(j0, gsc); let (gs1, gm1) = scale_min_k4(j1, gsc);
+                let (gs0, gm0) = (gscv[j0], gmv[j0]); let (gs1, gm1) = (gscv[j1], gmv[j1]);
                 let gw0 = vld1q_u8(gqs.add(jj * 32)); let gw1 = vld1q_u8(gqs.add(jj * 32 + 16));
                 let gd0 = sdot(sdot(vdupq_n_s32(0), vreinterpretq_s8_u8(vandq_u8(gw0, mask)), x0a), vreinterpretq_s8_u8(vandq_u8(gw1, mask)), x0b);
                 let gd1 = sdot(sdot(vdupq_n_s32(0), vreinterpretq_s8_u8(vshrq_n_u8::<4>(gw0)), x1a), vreinterpretq_s8_u8(vshrq_n_u8::<4>(gw1)), x1b);
@@ -123,7 +141,7 @@ unsafe fn q4k_gu(g: *const u8, u: *const u8, xq: *const i8, xs: *const f32, xsum
                 fg[1] = vfmaq_n_f32(fg[1], vcvtq_f32_s32(gd1), xs1 * gd * gs1 as f32);
                 mg += xs0 * gdm * gm0 as f32 * xm0 + xs1 * gdm * gm1 as f32 * xm1;
                 // up
-                let (us0, um0) = scale_min_k4(j0, usc); let (us1, um1) = scale_min_k4(j1, usc);
+                let (us0, um0) = (uscv[j0], umv[j0]); let (us1, um1) = (uscv[j1], umv[j1]);
                 let uw0 = vld1q_u8(uqs.add(jj * 32)); let uw1 = vld1q_u8(uqs.add(jj * 32 + 16));
                 let ud0 = sdot(sdot(vdupq_n_s32(0), vreinterpretq_s8_u8(vandq_u8(uw0, mask)), x0a), vreinterpretq_s8_u8(vandq_u8(uw1, mask)), x0b);
                 let ud1 = sdot(sdot(vdupq_n_s32(0), vreinterpretq_s8_u8(vshrq_n_u8::<4>(uw0)), x1a), vreinterpretq_s8_u8(vshrq_n_u8::<4>(uw1)), x1b);
