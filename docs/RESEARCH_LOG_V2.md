@@ -169,3 +169,25 @@ parallelism rearchitecture (persistent per-layer parallel region, minimal barrie
 all glue vectorized/parallel). To reach ~100 needs that PLUS ~2x kernel throughput.
 Both are real, scoped, multi-session efforts. Incremental tweaking has hit diminishing
 returns (~1 tok/s/change). Correct + improving; 100 remains an open optimization target.
+
+## 2026-07-05 — barrier analysis: the fork-join floor (final, 30.1 tok/s)
+
+Measured the smoking gun: **337 par() barriers/token × ~35µs each ≈ 12ms of the ~33ms
+budget** — barrier wakeups dominate. Root: workers park (condvar) during the serial glue
+between pars (quant_i8, rmsnorm, router), then pay a full wakeup for the next par.
+gpt-oss stayed fast with the SAME pool because it has 24 layers (not 48) → half the
+barriers, and less serial glue between them.
+
+Attempts to cut barrier cost (all MEASURED):
+- Full spin pool: util 10.5/12 cores but 20.6 tok/s (SLOWER — spinning wastes cycles +
+  atomic cache-line contention on shared counters). Same lesson as gpt-oss E15.
+- Short-spin (2µs) hybrid + atomic dispatch: 21.4 tok/s (still slower — contention).
+- Serialize small ops (QK-norm: ~2µs work but 35µs barrier): +0.8 → 30.1. Correct win
+  but small (few such ops exist).
+
+CONCLUSION (definitive): the condvar fork-join pool at ~30 tok/s is the ceiling of THIS
+execution model for 48-layer single-token decode. The ~12ms barrier tax is structural.
+Beating llama.cpp (47.7) / reaching 100 requires a DIFFERENT model — dependency-aware
+persistent scheduling with minimal sync, or sequence batching — not incremental tuning.
+Spin-based barrier reduction is counterproductive here (proven twice). Correct + stable
+at 30 tok/s; 100 needs an execution-model rewrite, scoped but out of incremental reach.

@@ -340,10 +340,8 @@ fn main() {
                     } }
                 });
             }
-            { let (qp, kp) = (P(q.as_mut_ptr()), P(k.as_mut_ptr()));
-              par(nh + nkv, &|a, b| { for h in a..b {
-                  if h < nh { let sl = unsafe { std::slice::from_raw_parts_mut(qp.g().add(h * hd), hd) }; rmsnorm_head(sl, &ly.q_norm); rope(sl, pos); }
-                  else { let hh = h - nh; let sl = unsafe { std::slice::from_raw_parts_mut(kp.g().add(hh * hd), hd) }; rmsnorm_head(sl, &ly.k_norm); rope(sl, pos); } } }); }
+            for h in 0..nh { rmsnorm_head(&mut q[h * hd..(h + 1) * hd], &ly.q_norm); rope(&mut q[h * hd..(h + 1) * hd], pos); }
+            for h in 0..nkv { rmsnorm_head(&mut k[h * hd..(h + 1) * hd], &ly.k_norm); rope(&mut k[h * hd..(h + 1) * hd], pos); }
             kc[il][pos * nkv * hd..(pos + 1) * nkv * hd].copy_from_slice(&k);
             vc[il][pos * nkv * hd..(pos + 1) * nkv * hd].copy_from_slice(&v);
             let scale = 1.0 / (hd as f32).sqrt();
