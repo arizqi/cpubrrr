@@ -227,3 +227,33 @@ So 100 tok/s on Qwen3-Coder requires lossy quant that degrades quality — not a
 110 because MXFP4 is symmetric — no min to unpack.) Honest stop: we beat the mature
 baseline 1.37x with the rewrite; exactly-100 needs either a symmetric-quant model or SME
 (which doesn't fit single-vector GEMV).
+
+## 2026-07-05 — CORRECTION: earlier Qwen3-Coder claims do not hold up
+
+Rigorous fair measurement overturned two earlier claims in this log:
+
+1. **The llama.cpp baseline (47.7 tok/s) was contaminated** — measured while the 65GB
+   gpt-oss:120b download ran concurrently, starving it. Clean, llama.cpp does ~75 tok/s
+   on qwen3-coder:30b CPU (measured 75.2 cool). So the "cpubrrr beats llama.cpp 1.37x"
+   claim is FALSE — it compared against a crippled baseline.
+
+2. **engine_qwen2's spin-barrier design is fragile, not fast.** In isolation it swings
+   52 -> 5 -> 8 -> 42 tok/s. Root cause: 12 spinning workers saturate all 12 P-cores,
+   leaving none for the OS kernel; the OS preempts a worker, and the sense-reversing
+   spin-barrier then stalls all 11 others. The "65.5 peak" is a lucky-scheduling
+   artifact, not a reliable number. (Same "spinning is fragile" lesson as V1 E15 /
+   the earlier spin-pool regressions — now definitive.)
+
+HONEST STANDING on Qwen3-Coder (CPU decode):
+- llama.cpp: ~75 tok/s (robust).
+- cpubrrr robust engine (engine_qwen.rs, condvar fork-join): ~29-30 tok/s, stable.
+- cpubrrr v2 (engine_qwen2.rs, spin): unreliable (5-65), NOT usable.
+=> We do NOT beat llama.cpp on Qwen3-Coder; we are ~2.5x slower with the robust engine.
+The 100 tok/s target is not met; the gap to llama.cpp is real.
+
+NOTE: all measurements taken while the machine was thermally saturated after a long
+session (both engines showed 3-5x swings). Numbers need re-verification on a cool
+machine. The gpt-oss comparisons (llama.cpp 14.7 for MXFP4-MoE) should ALSO be
+re-verified clean — though MXFP4-MoE is a documented llama.cpp weak path, so that
+win is more plausible than the Qwen one. Do not trust any single measurement from
+this session's tail as final.
