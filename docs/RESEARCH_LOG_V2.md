@@ -131,3 +131,25 @@ correct-and-competitive achieved; 100 tok/s on this model is a real open effort.
 ### Standing (all 3 top targets RUN correctly on the cpubrrr engine)
 - gpt-oss-120b: 19 tok/s (Move 1) ✓  | Qwen3-Coder-30B: 25 tok/s (Move 2) ✓
 - Qwen3-30B general (Move 3): same engine, drop-in ✓
+
+## 2026-07-05 — Qwen3-Coder optimization grind (25 → 27.6 tok/s) + root cause
+
+Tried 7 kernel/parallelism changes, measuring each:
+- deferred horizontal reduction in q4k/q6k: no change (not reduction-bound)
+- 4 independent accumulators: no change (not accumulator-latency-bound)
+- sub-block pair processing (halve qs loads): +0.7 (not load-bound)
+- gate/up sequential streams (memory prefetch): no change (not access-pattern-bound)
+- parallelize router (128 experts) + silu: +2.6 → 27.6
+
+ROOT CAUSE found via CPU-util sampling: only ~6.5-7.3 of 12 cores busy during decode.
+The engine is BARRIER/SERIALIZATION-bound, not kernel-bound — ~8 par() calls/layer ×
+48 = ~384 barriers/token, plus serial glue (router, QK-norm/rope, quant_i8, silu, ffn
+sum) running on the main thread while 11 workers sleep. Kernel micro-opts don't help
+because the kernel isn't the limiter; core saturation is.
+
+Path to ~46 (beat llama.cpp 47.7): saturate all 12 cores — needs FEWER, BIGGER parallel
+regions (fuse gate+up+silu+down into ~2 par/layer; parallelize/vectorize the serial
+glue) and lower barrier overhead. Path to ~100: that PLUS ~2× faster kernels (the
+bandwidth ceiling ~160 leaves room). This is a parallelism rearchitecture — a focused
+effort, not incremental tweaks. Incremental parallelization of serial chunks yields
+~1 tok/s each (diminishing). Correctness preserved throughout (matches Ollama).

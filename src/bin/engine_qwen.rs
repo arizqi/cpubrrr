@@ -61,7 +61,7 @@ unsafe fn sdot(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
 unsafe fn q4k_dot(row: *const u8, xq: *const i8, xs: *const f32, xsum: *const i32, cols: usize) -> f32 {
     unsafe {
         let mask = vdupq_n_u8(0x0F);
-        let mut facc = vdupq_n_f32(0.0);   // deferred: accumulate scale*sdot lanes, one reduce at end
+        let mut f = [vdupq_n_f32(0.0); 4];  // 4 independent accumulators to hide vfma/sdot latency
         let mut minacc = 0f32;
         for sb in 0..cols / 256 {
             let b = row.add(sb * 144);
@@ -69,27 +69,30 @@ unsafe fn q4k_dot(row: *const u8, xq: *const i8, xs: *const f32, xsum: *const i3
             let dmin = half_to_f32(u16::from_le_bytes([*b.add(2), *b.add(3)]));
             let scales = std::slice::from_raw_parts(b.add(4), 12);
             let qs = b.add(16);
-            for j in 0..8 {
-                let (sc, m) = scale_min_k4(j, scales);
-                let blk = sb * 8 + j;
-                let qbase = qs.add((j / 2) * 32);
-                let w0 = vld1q_u8(qbase);
-                let w1 = vld1q_u8(qbase.add(16));
-                let (n0, n1) = if j % 2 == 0 { (vandq_u8(w0, mask), vandq_u8(w1, mask)) }
-                    else { (vshrq_n_u8::<4>(w0), vshrq_n_u8::<4>(w1)) };
-                let s = sdot(sdot(vdupq_n_s32(0), vreinterpretq_s8_u8(n0), vld1q_s8(xq.add(blk * 32))),
-                             vreinterpretq_s8_u8(n1), vld1q_s8(xq.add(blk * 32 + 16)));
-                let xsb = *xs.add(blk);
-                facc = vfmaq_n_f32(facc, vcvtq_f32_s32(s), xsb * d * sc as f32);
-                minacc += xsb * dmin * m as f32 * *xsum.add(blk) as f32;
+            for jj in 0..4 {  // process sub-block pairs: one qs load serves even (low) + odd (high) nibbles
+                let (j0, j1) = (jj * 2, jj * 2 + 1);
+                let (sc0, m0) = scale_min_k4(j0, scales);
+                let (sc1, m1) = scale_min_k4(j1, scales);
+                let (blk0, blk1) = (sb * 8 + j0, sb * 8 + j1);
+                let qb = qs.add(jj * 32);
+                let w0 = vld1q_u8(qb);
+                let w1 = vld1q_u8(qb.add(16));
+                let s0 = sdot(sdot(vdupq_n_s32(0), vreinterpretq_s8_u8(vandq_u8(w0, mask)), vld1q_s8(xq.add(blk0 * 32))),
+                              vreinterpretq_s8_u8(vandq_u8(w1, mask)), vld1q_s8(xq.add(blk0 * 32 + 16)));
+                let s1 = sdot(sdot(vdupq_n_s32(0), vreinterpretq_s8_u8(vshrq_n_u8::<4>(w0)), vld1q_s8(xq.add(blk1 * 32))),
+                              vreinterpretq_s8_u8(vshrq_n_u8::<4>(w1)), vld1q_s8(xq.add(blk1 * 32 + 16)));
+                let (xs0, xs1) = (*xs.add(blk0), *xs.add(blk1));
+                f[0] = vfmaq_n_f32(f[0], vcvtq_f32_s32(s0), xs0 * d * sc0 as f32);
+                f[1] = vfmaq_n_f32(f[1], vcvtq_f32_s32(s1), xs1 * d * sc1 as f32);
+                minacc += xs0 * dmin * m0 as f32 * *xsum.add(blk0) as f32 + xs1 * dmin * m1 as f32 * *xsum.add(blk1) as f32;
             }
         }
-        vaddvq_f32(facc) - minacc
+        vaddvq_f32(vaddq_f32(vaddq_f32(f[0], f[1]), vaddq_f32(f[2], f[3]))) - minacc
     }
 }
 unsafe fn q6k_dot(row: *const u8, xq: *const i8, xs: *const f32, cols: usize) -> f32 {
     unsafe {
-        let mut facc = vdupq_n_f32(0.0);
+        let mut f = [vdupq_n_f32(0.0); 4];
         for sb in 0..cols / 256 {
             let b = row.add(sb * 210);
             let (ql, qh, sc) = (b, b.add(128), b.add(192));
@@ -109,10 +112,10 @@ unsafe fn q6k_dot(row: *const u8, xq: *const i8, xs: *const f32, cols: usize) ->
                 let blk = sb * 8 + s16 / 2;
                 let sd = sdot(vdupq_n_s32(0), vld1q_s8(t.as_ptr().add(s16 * 16)),
                     vld1q_s8(xq.add(blk * 32 + (s16 % 2) * 16)));
-                facc = vfmaq_n_f32(facc, vcvtq_f32_s32(sd), *xs.add(blk) * d * (*sc.add(s16) as i8 as f32));
+                f[s16 & 3] = vfmaq_n_f32(f[s16 & 3], vcvtq_f32_s32(sd), *xs.add(blk) * d * (*sc.add(s16) as i8 as f32));
             }
         }
-        vaddvq_f32(facc)
+        vaddvq_f32(vaddq_f32(vaddq_f32(f[0], f[1]), vaddq_f32(f[2], f[3])))
     }
 }
 
@@ -207,6 +210,7 @@ fn par(n: usize, f: &(dyn Fn(usize, usize) + Sync)) {
     sh.go.notify_all();
     while st.rem > 0 { st = sh.done.wait(st).unwrap(); }
 }
+
 
 #[derive(Clone, Copy)] struct P(*mut f32);
 unsafe impl Send for P {} unsafe impl Sync for P {}
@@ -364,7 +368,9 @@ fn main() {
 
             // MoE
             let xn2 = rmsnorm(&x, &ly.ffn_norm);
-            let logits: Vec<f32> = (0..c.ne).map(|e| { let mut a = 0.0; for j in 0..d { a += ly.gate_inp[e * d + j] * xn2[j]; } a }).collect();
+            let mut logits = vec![0f32; c.ne];
+            { let out = P(logits.as_mut_ptr()); let xn2r = &xn2;
+              par(c.ne, &|a, b| { for e in a..b { let mut acc = 0.0; for j in 0..d { acc += ly.gate_inp[e * d + j] * xn2r[j]; } unsafe { *out.g().add(e) = acc; } } }); }
             let lmax = logits.iter().cloned().fold(f32::MIN, f32::max);
             let exps: Vec<f32> = logits.iter().map(|l| (l - lmax).exp()).collect();
             let sm: f32 = exps.iter().sum();
@@ -376,20 +382,21 @@ fn main() {
 
             let (x2q, x2s, x2m) = quant_i8(&xn2);
             // gate+up batched over all active experts: topk*ff rows
-            let mut hbuf = vec![0f32; c.topk * ff];
+            let mut gbuf = vec![0f32; c.topk * ff];
+            let mut ubuf = vec![0f32; c.topk * ff];
             {
-                let out = P(hbuf.as_mut_ptr());
+                let (gp, up_) = (P(gbuf.as_mut_ptr()), P(ubuf.as_mut_ptr()));
                 let (x2q, x2s, x2m, top) = (&x2q, &x2s, &x2m, &top);
-                par(c.topk * ff, &|a, b| {
-                    for it in a..b {
-                        let (ei, r) = (it / ff, it % ff);
-                        let gr = top[ei] * ff + r;
-                        let g = unsafe { ly.gate.dot(gr, x2q.as_ptr(), x2s.as_ptr(), x2m.as_ptr()) };
-                        let u = unsafe { ly.up.dot(gr, x2q.as_ptr(), x2s.as_ptr(), x2m.as_ptr()) };
-                        unsafe { *out.g().add(it) = (g / (1.0 + (-g).exp())) * u; }
-                    }
-                });
+                // gate: pure sequential stream over gate tensor
+                par(c.topk * ff, &|a, b| { for it in a..b { let (ei, r) = (it / ff, it % ff);
+                    unsafe { *gp.g().add(it) = ly.gate.dot(top[ei] * ff + r, x2q.as_ptr(), x2s.as_ptr(), x2m.as_ptr()); } } });
+                // up: pure sequential stream over up tensor
+                par(c.topk * ff, &|a, b| { for it in a..b { let (ei, r) = (it / ff, it % ff);
+                    unsafe { *up_.g().add(it) = ly.up.dot(top[ei] * ff + r, x2q.as_ptr(), x2s.as_ptr(), x2m.as_ptr()); } } });
             }
+            let mut hbuf = vec![0f32; c.topk * ff];
+            { let out = P(hbuf.as_mut_ptr()); let (gb, ub) = (&gbuf, &ubuf);
+              par(c.topk * ff, &|a, b| { for it in a..b { let g = gb[it]; unsafe { *out.g().add(it) = (g / (1.0 + (-g).exp())) * ub[it]; } } }); }
             // down batched: topk*d rows, weighted accumulate
             let mut ffn = vec![0f32; c.topk * d];
             {
@@ -451,5 +458,6 @@ fn main() {
     }
     let dt = t2.elapsed().as_secs_f64();
     println!("\n---\ndecode: {n} tokens in {dt:.2}s = {:.1} tok/s", n as f64 / dt);
+
 
 }
