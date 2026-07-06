@@ -288,3 +288,38 @@ NT=10 sacrificed 2 cores vs llama.cpp's 12. Fix: NT=12 + a YIELDING barrier (spi
 Honest standing: cpubrrr ~64 vs llama.cpp ~77 = 83% (robust). Yield barrier + all 12
 cores is the sound design; supersedes NT=10 (~59). Remaining gap to llama.cpp is
 kernel efficiency (they run the same Q4_K weights faster) — the real next lever.
+
+## 2026-07-06 — GPU/CPU verification: the retraction OVER-corrected. Full evidence chain.
+
+User asked: "are you sure llama.cpp makes no GPU calls?" Verified via Ollama server
+logs (~/.ollama/logs/server.log), which record every model load's actual placement:
+
+1. **Ollama/llama.cpp DEFAULTS to full GPU on macOS**: default loads log
+   "offloaded 49/49 layers to GPU", weights device=Metal. Metal backend always
+   initializes.
+2. **num_gpu:0 IS honored on fresh loads**: controlled test logged
+   "offloaded 0/49 layers to GPU", weights device=CPU → decode 16.2 tok/s. The
+   bench script (cpu mode) verified the same: 0/49 → 15.8 tok/s.
+3. **THE KEY FINDING: yesterday's "clean llama.cpp CPU = 75-77" runs were GPU runs.**
+   The log shows every qwen3-coder load in that window (12:45–12:56) as
+   "offloaded 49/49 layers to GPU". Mechanism unclear (instance reuse or option not
+   applied on those loads) — but placement is logged fact. So the previous
+   correction's baseline was itself wrong: it retracted our win against a GPU number.
+4. cpubrrr cannot use the GPU at all: binary links only libSystem (otool-verified).
+
+CORRECTED HONEST STANDING (Qwen3-Coder-30B decode):
+- llama.cpp CPU (log-verified 0/49): **~16 tok/s** (16.2, 15.8 measured cool-ish).
+  Consistent with gpt-oss:20b CPU 14.7 — llama.cpp's CPU-MoE path is ~15 tok/s weak
+  on BOTH quant formats, coherent with the E7 finding.
+- cpubrrr (CPU-only by construction): **~66 tok/s** (6-run stable on cool machine).
+- → **cpubrrr ≈ 4× llama.cpp CPU** on qwen3-coder. And ≈86% of Ollama's Metal GPU
+  (75-77).
+- The 2026-07-05 "we do NOT beat llama.cpp / are 2.5x slower" correction is ITSELF
+  RETRACTED as to the CPU comparison: it compared against GPU numbers.
+
+Session-tail thermal collapse observed again (llama.cpp CPU 3.0, cpubrrr 12) — all
+absolutes need one final cool-machine confirmation pass. ACTION ITEMS:
+(a) bench_ollama.sh must auto-verify placement from the server log per run and PRINT
+    it — no more trusting options.
+(b) One cool-machine verification session: llama.cpp CPU / GPU, cpubrrr, all
+    log-verified, before publishing any comparison.
