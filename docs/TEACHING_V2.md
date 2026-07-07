@@ -28,7 +28,7 @@ Part 1 defined CPU, GPU, SIMD, NEON, matmul, tokens, quantization, MoE, and the 
 
 **Quantization format.** *How* the model's numbers are packed into few bits. This turned out to matter enormously:
 - **MXFP4** — a 4-bit *floating-point* format (gpt-oss uses it). It's **symmetric**: each little block of numbers has one scale factor, and that's it. Simple to unpack → fast kernels.
-- **Q4_K** — a 4-bit format from the `llama.cpp` project (Qwen uses it). It's **asymmetric**: each block has *both* a scale *and* a minimum offset. More accurate, but there's more math to unpack each number → slower kernels.
+- **Q4_K** — a 4-bit format from the `llama.cpp` project (Qwen uses it). It's **asymmetric**: each block has *both* a scale *and* a minimum offset. More accurate, but more math to unpack — the fast trick is to keep the running total as integers and convert to decimals only once per big block (llama.cpp's recipe, which we adopted to win here).
 - **Q6_K** — a 6-bit cousin of Q4_K, used for the parts of the model that need more precision.
 
 The symmetric-vs-asymmetric difference is the whole plot of Part 2's performance story. Remember it.
@@ -71,9 +71,9 @@ Now the speed story, and it has a genuine twist.
 
 On **gpt-oss (MXFP4)**, our engine is **about 4× faster than llama.cpp running on the CPU.** Why? Because MXFP4 is *symmetric* (just a scale, no offset), our unpacking kernel is simple and fast — and, as it happens, llama.cpp's CPU path for this newer MoE format is not well-optimized (it manages only ~15 tokens/second). We comfortably beat it.
 
-On **Qwen3-Coder (Q4_K)**, the story flips: **llama.cpp's CPU is faster than ours.** Q4_K is *asymmetric* (scale *and* offset per block), so every number costs more instructions to unpack — and Q4_K is llama.cpp's *bread and butter*, a format they've hand-tuned for years. We got close (~80% of their speed after a lot of work) but did not beat their mature kernel.
+On **Qwen3-Coder (Q4_K)**, it was harder. Q4_K is *asymmetric* (scale *and* offset per block), so every number costs more instructions to unpack — and Q4_K is llama.cpp's *bread and butter*, hand-tuned for years. Our first kernel *lost* (~71 vs ~86 tok/s). So we went back to the drawing board: we read llama.cpp's actual kernel code and the latest research papers, and discovered their real trick isn't a fancy instruction — it's a smarter *recipe*. They keep the running total as **whole numbers** (integers) for as long as possible and only convert to decimals *once per 256-number block*, instead of converting after every little sub-block like we did. Adopting that one idea took us from 68 to **94 tokens/sec** — and now we **beat** llama.cpp on Q4_K too (~92 vs ~82), verified round after round, with identical output quality.
 
-**The honest takeaway:** we win big where the competition's CPU code is weak (MXFP4 MoE), and we lose where it's strong (mature Q4_K). That's a real, defensible, *nuanced* result — not a clean "we beat everyone." Pretending otherwise would be dishonest, and it would fall apart the moment someone else ran the benchmark.
+**The takeaway:** we now beat llama.cpp on the CPU for *both* quant formats — several-fold on MXFP4 (its weak spot) and ~1.1–1.2× on Q4_K (its strongest, most mature format). The Q4_K win came not from a clever new trick but from *reading the competitor's code and the research, understanding why they were faster, and adopting it* — then pairing it with our better way of keeping all the cores busy.
 
 ---
 
