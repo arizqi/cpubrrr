@@ -79,86 +79,43 @@ unsafe fn sdot(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
         r
     }
 }
-unsafe fn q4k_dot(row: *const u8, xq: *const i8, xs: *const f32, xsum: *const i32, cols: usize) -> f32 {
+unsafe fn q4k_dot(row: *const u8, xq: *const i8, ys: *const f32, xsum32: *const i32, cols: usize) -> f32 {
     unsafe {
         let mask = vdupq_n_u8(0x0F);
-        let mut f = [vdupq_n_f32(0.0); 4];
-        let mut minacc = 0f32;
+        let mut sumf = 0f32;
         for sb in 0..cols / 256 {
             let b = row.add(sb * 144);
             let d = half_to_f32(u16::from_le_bytes([*b, *b.add(1)]));
             let dmin = half_to_f32(u16::from_le_bytes([*b.add(2), *b.add(3)]));
-            let scales = std::slice::from_raw_parts(b.add(4), 12);
+            let (sc, mn) = unpack_k4(b.add(4));
             let qs = b.add(16);
-            // precompute 8 (d*sc, dmin*m) once per superblock (hoist branchy extraction)
-            let mut dsc = [0f32; 8]; let mut dm = [0f32; 8];
-            for j in 0..8 { let (sc, m) = scale_min_k4(j, scales); dsc[j] = d * sc as f32; dm[j] = dmin * m as f32; }
+            let mut acc = vdupq_n_s32(0);
             for jj in 0..4 {
                 let (j0, j1) = (jj * 2, jj * 2 + 1);
                 let (blk0, blk1) = (sb * 8 + j0, sb * 8 + j1);
-                let qb = qs.add(jj * 32);
-                let w0 = vld1q_u8(qb);
-                let w1 = vld1q_u8(qb.add(16));
+                let w0 = vld1q_u8(qs.add(jj * 32));
+                let w1 = vld1q_u8(qs.add(jj * 32 + 16));
                 let s0 = sdot(sdot(vdupq_n_s32(0), vreinterpretq_s8_u8(vandq_u8(w0, mask)), vld1q_s8(xq.add(blk0 * 32))),
                               vreinterpretq_s8_u8(vandq_u8(w1, mask)), vld1q_s8(xq.add(blk0 * 32 + 16)));
                 let s1 = sdot(sdot(vdupq_n_s32(0), vreinterpretq_s8_u8(vshrq_n_u8::<4>(w0)), vld1q_s8(xq.add(blk1 * 32))),
                               vreinterpretq_s8_u8(vshrq_n_u8::<4>(w1)), vld1q_s8(xq.add(blk1 * 32 + 16)));
-                let (xs0, xs1) = (*xs.add(blk0), *xs.add(blk1));
-                f[0] = vfmaq_n_f32(f[0], vcvtq_f32_s32(s0), xs0 * dsc[j0]);
-                f[1] = vfmaq_n_f32(f[1], vcvtq_f32_s32(s1), xs1 * dsc[j1]);
-                minacc += xs0 * dm[j0] * *xsum.add(blk0) as f32 + xs1 * dm[j1] * *xsum.add(blk1) as f32;
+                acc = vmlaq_n_s32(acc, s0, sc[j0] as i32);
+                acc = vmlaq_n_s32(acc, s1, sc[j1] as i32);
             }
+            let mut mint = 0i32;
+            for j in 0..8 { mint += mn[j] as i32 * *xsum32.add(sb * 8 + j); }
+            let ysb = *ys.add(sb);
+            sumf += ysb * d * vaddvq_s32(acc) as f32 - ysb * dmin * mint as f32;
         }
-        vaddvq_f32(vaddq_f32(vaddq_f32(f[0], f[1]), vaddq_f32(f[2], f[3]))) - minacc
+        sumf
     }
 }
-/// Fused gate+up Q4_K: shared xq loads, 2 independent weight streams (ILP). -> (gate, up)
-unsafe fn q4k_gu(g: *const u8, u: *const u8, xq: *const i8, xs: *const f32, xsum: *const i32, cols: usize) -> (f32, f32) {
+unsafe fn q6k_dot(row: *const u8, xq: *const i8, ys: *const f32, cols: usize) -> f32 {
     unsafe {
-        let mask = vdupq_n_u8(0x0F);
-        let mut fg = [vdupq_n_f32(0.0); 2];
-        let mut fu = [vdupq_n_f32(0.0); 2];
-        let (mut mg, mut mu) = (0f32, 0f32);
-        for sb in 0..cols / 256 {
-            let gb = g.add(sb * 144); let ub = u.add(sb * 144);
-            let gd = half_to_f32(u16::from_le_bytes([*gb, *gb.add(1)])); let gdm = half_to_f32(u16::from_le_bytes([*gb.add(2), *gb.add(3)]));
-            let ud = half_to_f32(u16::from_le_bytes([*ub, *ub.add(1)])); let udm = half_to_f32(u16::from_le_bytes([*ub.add(2), *ub.add(3)]));
-            let (gscv, gmv) = unpack_k4(gb.add(4)); let (uscv, umv) = unpack_k4(ub.add(4));
-            let (gqs, uqs) = (gb.add(16), ub.add(16));
-            for jj in 0..4 {
-                let (j0, j1) = (jj * 2, jj * 2 + 1);
-                let (blk0, blk1) = (sb * 8 + j0, sb * 8 + j1);
-                let x0a = vld1q_s8(xq.add(blk0 * 32)); let x0b = vld1q_s8(xq.add(blk0 * 32 + 16));
-                let x1a = vld1q_s8(xq.add(blk1 * 32)); let x1b = vld1q_s8(xq.add(blk1 * 32 + 16));
-                let (xs0, xs1) = (*xs.add(blk0), *xs.add(blk1));
-                let (xm0, xm1) = (*xsum.add(blk0) as f32, *xsum.add(blk1) as f32);
-                // gate
-                let (gs0, gm0) = (gscv[j0], gmv[j0]); let (gs1, gm1) = (gscv[j1], gmv[j1]);
-                let gw0 = vld1q_u8(gqs.add(jj * 32)); let gw1 = vld1q_u8(gqs.add(jj * 32 + 16));
-                let gd0 = sdot(sdot(vdupq_n_s32(0), vreinterpretq_s8_u8(vandq_u8(gw0, mask)), x0a), vreinterpretq_s8_u8(vandq_u8(gw1, mask)), x0b);
-                let gd1 = sdot(sdot(vdupq_n_s32(0), vreinterpretq_s8_u8(vshrq_n_u8::<4>(gw0)), x1a), vreinterpretq_s8_u8(vshrq_n_u8::<4>(gw1)), x1b);
-                fg[0] = vfmaq_n_f32(fg[0], vcvtq_f32_s32(gd0), xs0 * gd * gs0 as f32);
-                fg[1] = vfmaq_n_f32(fg[1], vcvtq_f32_s32(gd1), xs1 * gd * gs1 as f32);
-                mg += xs0 * gdm * gm0 as f32 * xm0 + xs1 * gdm * gm1 as f32 * xm1;
-                // up
-                let (us0, um0) = (uscv[j0], umv[j0]); let (us1, um1) = (uscv[j1], umv[j1]);
-                let uw0 = vld1q_u8(uqs.add(jj * 32)); let uw1 = vld1q_u8(uqs.add(jj * 32 + 16));
-                let ud0 = sdot(sdot(vdupq_n_s32(0), vreinterpretq_s8_u8(vandq_u8(uw0, mask)), x0a), vreinterpretq_s8_u8(vandq_u8(uw1, mask)), x0b);
-                let ud1 = sdot(sdot(vdupq_n_s32(0), vreinterpretq_s8_u8(vshrq_n_u8::<4>(uw0)), x1a), vreinterpretq_s8_u8(vshrq_n_u8::<4>(uw1)), x1b);
-                fu[0] = vfmaq_n_f32(fu[0], vcvtq_f32_s32(ud0), xs0 * ud * us0 as f32);
-                fu[1] = vfmaq_n_f32(fu[1], vcvtq_f32_s32(ud1), xs1 * ud * us1 as f32);
-                mu += xs0 * udm * um0 as f32 * xm0 + xs1 * udm * um1 as f32 * xm1;
-            }
-        }
-        (vaddvq_f32(vaddq_f32(fg[0], fg[1])) - mg, vaddvq_f32(vaddq_f32(fu[0], fu[1])) - mu)
-    }
-}
-unsafe fn q6k_dot(row: *const u8, xq: *const i8, xs: *const f32, cols: usize) -> f32 {
-    unsafe {
-        let mut f = [vdupq_n_f32(0.0); 4];
+        let mut sumf = 0f32;
         for sb in 0..cols / 256 {
             let b = row.add(sb * 210);
-            let (ql, qh, sc) = (b, b.add(128), b.add(192));
+            let (ql, qh, scp) = (b, b.add(128), b.add(192));
             let d = half_to_f32(u16::from_le_bytes([*b.add(208), *b.add(209)]));
             let mut t = [0i8; 256];
             let m0f = vdupq_n_u8(0x0F); let m3 = vdupq_n_u8(0x03); let n32 = vdupq_n_s8(32);
@@ -180,13 +137,14 @@ unsafe fn q6k_dot(row: *const u8, xq: *const i8, xs: *const f32, cols: usize) ->
                     vst1q_s8(tb.add(off + 96), vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(qlb), h3)), n32));
                 }
             }
+            let mut acc = vdupq_n_s32(0);
             for s16 in 0..16 {
-                let blk = sb * 8 + s16 / 2;
-                let sd = sdot(vdupq_n_s32(0), vld1q_s8(t.as_ptr().add(s16 * 16)), vld1q_s8(xq.add(blk * 32 + (s16 % 2) * 16)));
-                f[s16 & 3] = vfmaq_n_f32(f[s16 & 3], vcvtq_f32_s32(sd), *xs.add(blk) * d * (*sc.add(s16) as i8 as f32));
+                let sd = sdot(vdupq_n_s32(0), vld1q_s8(t.as_ptr().add(s16 * 16)), vld1q_s8(xq.add(sb * 256 + s16 * 16)));
+                acc = vmlaq_n_s32(acc, sd, *scp.add(s16) as i8 as i32);
             }
+            sumf += *ys.add(sb) * d * vaddvq_s32(acc) as f32;
         }
-        vaddvq_f32(vaddq_f32(vaddq_f32(f[0], f[1]), vaddq_f32(f[2], f[3])))
+        sumf
     }
 }
 
@@ -275,15 +233,18 @@ fn bar(sh: &Shared, ls: &mut bool) {
     }
 }
 
-fn qblock(xn: *const f32, xq: *mut i8, xs: *mut f32, xsum: *mut i32, bl: usize) {
+/// Q8_K-style: one scale per 256-superblock (ys[sb]), int8 quants, per-32 sums (xsum).
+fn qblock(xn: *const f32, xq: *mut i8, ys: *mut f32, xsum: *mut i32, sb: usize) {
     unsafe {
         let mut amax = 1e-12f32;
-        for i in 0..32 { amax = amax.max((*xn.add(bl * 32 + i)).abs()); }
+        for i in 0..256 { amax = amax.max((*xn.add(sb * 256 + i)).abs()); }
         let sc = amax / 127.0;
-        *xs.add(bl) = sc;
-        let mut acc = 0i32;
-        for i in 0..32 { let qi = (*xn.add(bl * 32 + i) / sc).round().clamp(-127.0, 127.0) as i8; *xq.add(bl * 32 + i) = qi; acc += qi as i32; }
-        *xsum.add(bl) = acc;
+        *ys.add(sb) = sc;
+        for j in 0..8 {
+            let mut acc = 0i32;
+            for i in 0..32 { let qi = (*xn.add(sb * 256 + j * 32 + i) / sc).round().clamp(-127.0, 127.0) as i8; *xq.add(sb * 256 + j * 32 + i) = qi; acc += qi as i32; }
+            *xsum.add(sb * 8 + j) = acc;
+        }
     }
 }
 
@@ -325,7 +286,7 @@ fn forward_worker(sh: &Shared, wid: usize, ls: &mut bool) {
             // ---- attn rmsnorm: parallel reduction then normalize ----
             rmsnorm_par(sh, wid, ls, sh.x, sh.xn, ly.attn_norm.as_ptr(), d);
             // quant xn
-            { let (a, b) = sl(wid, nb); for bl in a..b { qblock(sh.xn, sh.xq, sh.xs, sh.xsum, bl); } }
+            { let (a, b) = sl(wid, d / 256); for bl in a..b { qblock(sh.xn, sh.xq, sh.xs, sh.xsum, bl); } }
             bar(sh, ls);
             // qkv matvec
             { let nr = nh * hd + 2 * nkv * hd; let (a, b) = sl(wid, nr);
@@ -370,7 +331,7 @@ fn forward_worker(sh: &Shared, wid: usize, ls: &mut bool) {
               } }
             bar(sh, ls);
             // quant ao
-            { let (a, b) = sl(wid, (nh * hd) / 32); for bl in a..b { qblock(sh.ao, sh.aq, sh.asc, sh.asm, bl); } }
+            { let (a, b) = sl(wid, (nh * hd) / 256); for bl in a..b { qblock(sh.ao, sh.aq, sh.asc, sh.asm, bl); } }
             bar(sh, ls);
             // o-proj + residual
             { let (a, b) = sl(wid, d); for r in a..b { *sh.x.add(r) += ly.wo.dot(r, sh.aq, sh.asc, sh.asm); } }
@@ -379,7 +340,7 @@ fn forward_worker(sh: &Shared, wid: usize, ls: &mut bool) {
             let _tr = if wid==0 { Some(Instant::now()) } else { None };
             // ffn rmsnorm
             rmsnorm_par(sh, wid, ls, sh.x, sh.xn, ly.ffn_norm.as_ptr(), d);
-            { let (a, b) = sl(wid, nb); for bl in a..b { qblock(sh.xn, sh.xq, sh.xs, sh.xsum, bl); } }
+            { let (a, b) = sl(wid, d / 256); for bl in a..b { qblock(sh.xn, sh.xq, sh.xs, sh.xsum, bl); } }
             bar(sh, ls);
             // router logits (parallel over experts)
             { let (a, b) = sl(wid, ne); for e in a..b { let mut acc = 0.0; for j in 0..d { acc += ly.gate_inp[e * d + j] * *sh.xn.add(j); } *sh.logits.add(e) = acc; } }
@@ -398,19 +359,20 @@ fn forward_worker(sh: &Shared, wid: usize, ls: &mut bool) {
             // gate/up/silu (parallel over topk*ff)
             { let (a, b) = sl(wid, topk * ff);
               for it in a..b { let (ei, r) = (it / ff, it % ff); let gr = top[ei] * ff + r;
-                let (g, u) = q4k_gu(ly.gate.ptr.add(gr * ly.gate.bpr), ly.up.ptr.add(gr * ly.up.bpr), sh.xq, sh.xs, sh.xsum, ly.gate.cols);
+                let g = q4k_dot(ly.gate.ptr.add(gr * ly.gate.bpr), sh.xq, sh.xs, sh.xsum, ly.gate.cols);
+                let u = q4k_dot(ly.up.ptr.add(gr * ly.up.bpr), sh.xq, sh.xs, sh.xsum, ly.up.cols);
                 *sh.hbuf.add(it) = (g / (1.0 + (-g).exp())) * u; } }
             bar(sh, ls);
             if let Some(t)=_tg { TM[1].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
             let _td = if wid==0 { Some(Instant::now()) } else { None };
             // quant hbuf per expert (parallel over topk*ff/32 blocks)
-            { let (a, b) = sl(wid, topk * ff / 32); for bl in a..b { qblock(sh.hbuf, sh.hq, sh.hs, sh.hm, bl); } }
+            { let (a, b) = sl(wid, topk * ff / 256); for bl in a..b { qblock(sh.hbuf, sh.hq, sh.hs, sh.hm, bl); } }
             bar(sh, ls);
             // down + weighted accumulate (expert-major for sequential row streaming)
             { let (a, b) = sl(wid, d);
               for r in a..b { *sh.x.add(r) += 0.0; } // no-op; accumulate below
               for ei in 0..topk {
-                let (hq, hs, hm) = (sh.hq.add(ei * ff), sh.hs.add(ei * (ff / 32)), sh.hm.add(ei * (ff / 32)));
+                let (hq, hs, hm) = (sh.hq.add(ei * ff), sh.hs.add(ei * (ff / 256)), sh.hm.add(ei * (ff / 32)));
                 let w = wts[ei]; let base = top[ei] * d;
                 for r in a..b { *sh.x.add(r) += w * ly.down.dot(base + r, hq, hs, hm); }
               } }
@@ -420,7 +382,7 @@ fn forward_worker(sh: &Shared, wid: usize, ls: &mut bool) {
         let _th = if wid==0 { Some(Instant::now()) } else { None };
         // ---- head ----
         rmsnorm_par(sh, wid, ls, sh.x, sh.xn, sh.out_norm.as_ptr(), d);
-        { let (a, b) = sl(wid, nb); for bl in a..b { qblock(sh.xn, sh.xq, sh.xs, sh.xsum, bl); } }
+        { let (a, b) = sl(wid, d / 256); for bl in a..b { qblock(sh.xn, sh.xq, sh.xs, sh.xsum, bl); } }
         bar(sh, ls);
         { let (a, b) = sl(wid, c.nvocab); let mut best = (f32::MIN, 0u32);
           for r in a..b { let l = sh.head.dot(r, sh.xq, sh.xs, sh.xsum); if l > best.0 { best = (l, r as u32); } }
@@ -530,10 +492,10 @@ fn main() {
         m: std::sync::Mutex::new(()), cv: std::sync::Condvar::new(), parked: AtomicUsize::new(0),
         dm: std::sync::Mutex::new(()), dcv: std::sync::Condvar::new(),
         layers, out_norm, head, tok_embd_off, blob: blob_ptr,
-        x: mk_f(d), xn: mk_f(d), xq: mk_i8(d), xs: mk_f(nb), xsum: mk_i32(nb),
+        x: mk_f(d), xn: mk_f(d), xq: mk_i8(d), xs: mk_f(d / 256), xsum: mk_i32(nb),
         q: mk_f(nh * hd), k: mk_f(nkv * hd), v: mk_f(nkv * hd), ao: mk_f(nh * hd),
-        aq: mk_i8(nh * hd), asc: mk_f((nh * hd) / 32), asm: mk_i32((nh * hd) / 32),
-        hbuf: mk_f(c.topk * ff), hq: mk_i8(c.topk * ff), hs: mk_f(c.topk * ff / 32), hm: mk_i32(c.topk * ff / 32),
+        aq: mk_i8(nh * hd), asc: mk_f((nh * hd) / 256), asm: mk_i32((nh * hd) / 32),
+        hbuf: mk_f(c.topk * ff), hq: mk_i8(c.topk * ff), hs: mk_f(c.topk * ff / 256), hm: mk_i32(c.topk * ff / 32),
         logits: mk_f(c.ne), partials: mk_f(NT), apart: mk_u64(NT),
         kc: mk_f(c.nl * MAXSEQ * nkv * hd), vc: mk_f(c.nl * MAXSEQ * nkv * hd),
     }));
