@@ -69,7 +69,7 @@ Here's the discipline that mattered: before writing a single line, we **recovere
 
 Now the speed story, and it has a genuine twist.
 
-On **gpt-oss (MXFP4)**, our engine is **several times faster than llama.cpp running on the CPU.** Why? Because MXFP4 is *symmetric* (just a scale, no offset), our unpacking kernel is simple and fast — and, as it happens, llama.cpp's CPU path for this newer MoE format is not well-optimized (it manages only ~15 tokens/second). We comfortably beat it.
+On **gpt-oss (MXFP4)**, our engine is **about 4× faster than llama.cpp running on the CPU.** Why? Because MXFP4 is *symmetric* (just a scale, no offset), our unpacking kernel is simple and fast — and, as it happens, llama.cpp's CPU path for this newer MoE format is not well-optimized (it manages only ~15 tokens/second). We comfortably beat it.
 
 On **Qwen3-Coder (Q4_K)**, the story flips: **llama.cpp's CPU is faster than ours.** Q4_K is *asymmetric* (scale *and* offset per block), so every number costs more instructions to unpack — and Q4_K is llama.cpp's *bread and butter*, a format they've hand-tuned for years. We got close (~80% of their speed after a lot of work) but did not beat their mature kernel.
 
@@ -110,11 +110,11 @@ The meta-lesson, now written in three places in our lab notes: **an unverified b
 What is **solidly true and verified**:
 - One CPU-only engine runs three real models (gpt-oss-120b, Qwen3-Coder-30B, Qwen3-30B) and produces correct output — verified against reference libraries and matching outputs.
 - It uses **no GPU at all** — the program links only the basic system library; using a GPU is physically impossible for it.
-- On **MXFP4 MoE models**, it is **several times faster than llama.cpp's CPU path** (whose weak spot this is; llama.cpp manages ~15 tok/s there).
+- On **MXFP4 MoE models** (gpt-oss), it is **~4× faster than llama.cpp's CPU path** (~55 vs ~14 tok/s — this format is llama.cpp's CPU weak spot).
 - The execution-model rewrite and the yielding-barrier fix are real, reproducible engineering wins.
 
 What is **honest but less flattering**:
-- On **mature Q4_K models**, llama.cpp's CPU is **faster than ours** — we reached ~80% of its speed, not more.
+- On **mature Q4_K models** (Qwen3-Coder), llama.cpp's CPU is **faster than ours** (~86 vs ~71 tok/s — we reached ~83% of its speed, not more).
 - Our engine is **thermally fragile** (it runs the cores hot and throttles), where llama.cpp is thermally steady.
 - **Exact tokens/second figures need a final clean-machine, log-verified measurement** before anyone should quote them. The *directions* above are solid; the precise numbers are pending.
 

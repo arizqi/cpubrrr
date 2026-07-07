@@ -64,10 +64,10 @@ We report *directions* with high confidence and note that exact figures require 
 
 | Model (CPU decode) | llama.cpp CPU (verified) | cpubrrr (CPU-only by construction) | Direction |
 |---|---|---|---|
-| gpt-oss:20b (MXFP4) | ~15 tok/s (stable) | ~50–110 tok/s | **cpubrrr faster, several-fold** |
-| Qwen3-Coder-30B (Q4_K) | ~85 tok/s (mature) | ~68 tok/s | **llama.cpp faster (~1.25×)** |
+| gpt-oss:20b (MXFP4) | 13.7 tok/s (stable) | ~55 tok/s (stable) | **cpubrrr ~4.0× faster** |
+| Qwen3-Coder-30B (Q4_K) | 85.7 tok/s (mature) | ~71 tok/s | **llama.cpp faster (~1.2×)** |
 
-The MXFP4 gap is large and robust: even our thermally-throttled floor (~50) exceeds llama.cpp's ~15 by >3×, consistent with llama.cpp's documented weak CPU-MoE path for MXFP4. The Q4_K gap favors llama.cpp: Q4_K is its mature format, and our quality-preserving ceiling (§3.2) sits below it. cpubrrr uses only the C standard library (`otool`-verified), so it *cannot* use the GPU; llama.cpp on macOS defaults to full Metal offload and must be explicitly and verifiably constrained to CPU.
+The MXFP4 gap is large and robust: our stable ~55 exceeds llama.cpp's ~14 by ~4×, consistent with llama.cpp's documented weak CPU-MoE path for MXFP4. The Q4_K gap favors llama.cpp: Q4_K is its mature format, and our quality-preserving ceiling (§3.2) sits below it. cpubrrr uses only the C standard library (`otool`-verified), so it *cannot* use the GPU; llama.cpp on macOS defaults to full Metal offload and must be explicitly and verifiably constrained to CPU.
 
 **We explicitly do not claim a general "beats llama.cpp" result.** We win where its CPU path is weak and lose where it is strong.
 
@@ -87,8 +87,8 @@ The meta-lesson: **results that flatter the author deserve more skepticism, not 
 
 ## 7. Limitations and future work
 
-- **Exact tok/s pending clean-machine verification.** Directions in §5 are robust; precise figures need a rested, cool, log-verified pass.
-- A suspected recent performance regression in the gpt-oss path (config-driven refactor and/or mmap paging) is under investigation; the MXFP4 win direction holds regardless, but the peak figure needs reconfirmation.
+- **Figures in §5 are the reproducible cool-machine, log-verified, contention-controlled numbers** (5/3-run stable). One caveat: an earlier ~110 tok/s for gpt-oss on a fresh machine was not reproducible after a week of sustained load (both original and current binaries measure ~55; not a code regression); the conservative ~55 is used, and the 4× MXFP4 win holds regardless.
+- The gpt-oss path shows no code regression (the initial-release binary measures identically to current, ~55); the earlier ~110 peak appears tied to a deeper machine-cool state we could not recreate. cpubrrr is contention-sensitive (targets all 12 cores); peak numbers require a quiet machine.
 - Q4_K decode is at a quality-preserving instruction ceiling on NEON; closing to llama.cpp likely needs a different arithmetic path.
 - Not a production server: no cross-request batching or serving hardening.
 - Results are Apple M4 (ARMv9+SME); portability to other ARM and to x86 (AVX-512) must be measured, not assumed.
