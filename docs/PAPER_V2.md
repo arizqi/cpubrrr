@@ -60,7 +60,7 @@ A pure spin-barrier saturated cores in isolation (~65 tok/s) but **collapsed to 
 
 ## 5. Performance: honest and format-dependent
 
-We report *directions* with high confidence and note that exact figures require a final clean-machine pass (§6). All llama.cpp figures are **placement-verified** from server logs (`offloaded N/M layers to GPU`); the "CPU" figures are confirmed 0 layers on GPU.
+Figures below are from a cool, quiet (no background browser), contention-controlled pass, 3–5 runs each (§6). All llama.cpp figures are **placement-verified** from server logs (`offloaded N/M layers to GPU`); the "CPU" figures are confirmed 0 layers on GPU.
 
 | Model (CPU decode) | llama.cpp CPU (verified) | cpubrrr (CPU-only by construction) | Direction |
 |---|---|---|---|
