@@ -323,3 +323,28 @@ absolutes need one final cool-machine confirmation pass. ACTION ITEMS:
     it — no more trusting options.
 (b) One cool-machine verification session: llama.cpp CPU / GPU, cpubrrr, all
     log-verified, before publishing any comparison.
+
+## 2026-07-06 — DEFINITIVE measurement (cool, Chrome closed, log-verified placement)
+
+Resolved the number-confusion saga. Root causes of all prior swings: (1) thermal
+throttling after sustained load, (2) unverified GPU/CPU placement, (3) BACKGROUND CPU
+CONTENTION — Chrome (~7 tabs, ~60% CPU) + a runaway pairedsyncd (44%) were stealing
+~2 cores from our all-12-core engine every measurement, silently varying. Closed Chrome,
+confirmed no throttle. cpubrrr numbers stabilized tightly.
+
+FINAL reproducible table (5-run/3-run stable, llama.cpp placement verified from logs):
+| model (CPU decode) | cpubrrr | llama.cpp CPU (verified) | ratio |
+|---|---|---|---|
+| gpt-oss:20b (MXFP4)   | ~55 tok/s (55.0-56.3) | 13.7 (0/25 GPU) | **cpubrrr 4.0x faster** |
+| Qwen3-Coder-30B (Q4_K)| ~71 tok/s (69.2-71.8) | 85.7 (0/49 GPU) | llama.cpp 1.2x faster |
+
+HONEST FINAL STORY (this supersedes ALL prior speed claims/corrections in this log):
+- On MXFP4 MoE (gpt-oss), cpubrrr is ~4x faster than llama.cpp's CPU path (its weak spot).
+- On mature Q4_K (qwen), llama.cpp CPU is ~1.2x faster than cpubrrr (~83% of it).
+- Note: the earlier "gpt-oss ~110" is NOT reproducible on this machine now; both the
+  original and current binaries measure ~55 stably. Not a code regression (verified by
+  building the initial-release commit — also 55). Likely the M4 Max lacks a deep cooldown
+  after a week of sustained load; a reboot may restore higher. Using the CONSERVATIVE
+  reproducible 55 for all public docs. Even at 55, the 4x MXFP4 win holds.
+- cpubrrr is contention-sensitive (wants all 12 cores); llama.cpp tolerates background
+  load better. Peak cpubrrr numbers require a quiet machine.
