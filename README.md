@@ -72,20 +72,15 @@ the new architecture produced correct output on the first run.
 
 ## Docs
 
-- **[docs/TEACHING_V2.md](docs/TEACHING_V2.md)** — first-principles walkthrough (Part 2):
-  running many models, the two-quant-format performance story, and the full
-  benchmark-integrity lesson. Every acronym defined. Start here.
-  ([Part 1](docs/TEACHING.md) covers the original single-model engine.)
-- **[docs/PAPER_V2.md](docs/PAPER_V2.md)** — write-up: config-driven engine across three
-  MoE architectures + a cautionary study in benchmark integrity.
 - **[docs/RESEARCH_LOG_V2.md](docs/RESEARCH_LOG_V2.md)** — chronological lab log: every
   measured number, every wrong number, every correction, in order.
+- **[docs/RESEARCH_LOG.md](docs/RESEARCH_LOG.md)** — the original single-model log.
 - **[docs/PLAN.md](docs/PLAN.md)** — first-principles ceilings and the experiment ladder.
 
 ## Requirements
 
 - Apple silicon Mac (M-series; developed on **M4 Max**, ARMv9 + SME). Other ARM/x86
-  targets need a port — see caveats in the teaching doc.
+  targets need a port — see the honest-limits section below.
 - [Rust](https://rustup.rs/) (stable), Python 3, and [Ollama](https://ollama.com/) with
   a model pulled (e.g. `ollama pull gpt-oss:20b` or `ollama pull qwen3-coder:30b`).
 
@@ -152,7 +147,7 @@ This is a **research engine**, not a production server (no cross-user batching, 
 serving hardening). Numbers are Apple M4; the techniques port to other ARM and (with
 AVX-512) x86, but those numbers must be measured, not assumed. A `training/kernel`
 research track programs the M4's SME/AMX matrix unit directly from Rust assembly
-(~4.2 TFLOPS fp32, measured to exceed Accelerate) — see the teaching doc. On training
+(~4.2 TFLOPS fp32, measured to exceed Accelerate) — see the research log. On training
 scale: consumer CPUs can realistically train models up to ~1B params; a
 trillion-parameter model is ~47,000 years of compute (physics, not pessimism).
 

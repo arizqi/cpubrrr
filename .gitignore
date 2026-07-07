@@ -14,5 +14,11 @@ index.json
 # OS / editor
 .DS_Store
 *.swp
+
+# Drafts kept local, not published in the repo
 docs/REDDIT_POST.md
 docs/REDDIT_POST_V2.md
+docs/PAPER.md
+docs/PAPER_V2.md
+docs/TEACHING.md
+docs/TEACHING_V2.md
