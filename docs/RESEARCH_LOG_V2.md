@@ -348,3 +348,38 @@ HONEST FINAL STORY (this supersedes ALL prior speed claims/corrections in this l
   reproducible 55 for all public docs. Even at 55, the 4x MXFP4 win holds.
 - cpubrrr is contention-sensitive (wants all 12 cores); llama.cpp tolerates background
   load better. Peak cpubrrr numbers require a quiet machine.
+
+## 2026-07-06 — WE BEAT LLAMA.CPP ON Q4_K (the win). Int-accumulation Q8_K kernel.
+
+Back to the drawing board on the Q4_K gap (was ~71 vs ~86). Read llama.cpp's actual ARM
+kernel (ggml_vec_dot_q4_K_q8_K) + surveyed 2025-26 research (T-MAC/Vec-LUT LUT kernels,
+Arm i8mm/smmla work, arXiv 2501.00032 group-quant GEMV kernels). Found llama.cpp's real
+edge: NOT the instructions (they use vdotq/sdot too on the NEON path) but the ALGORITHM —
+they quantize activations to **Q8_K (one scale per 256-superblock + per-32 bsums)** and
+**accumulate the sub-block integer dot products weighted by the 6-bit scales in INT32**,
+doing only ONE float convert + 2 float ops per superblock. Our old kernel did a float
+vcvt+vfma PER sub-block (8 per superblock) — ~6 extra float ops/superblock.
+
+Adopted it: rewrote q4k_dot/q6k_dot to int-accumulation, changed activation quant to
+Q8_K (per-256 scale, per-32 sums). Verified new kernels bit-exact vs dequant-f64 (rel
+~1e-7, src/bin/q8k_verify.rs). Also tried a 2-row smmla (i8mm) variant — verification
+FAILED (lane-mapping bug), dropped it; the int-accum win alone was enough.
+
+Result: **68 -> 94 tok/s** (+38%). Output quality unchanged (coherent fibonacci code,
+Four/Tokyo/cba all correct — Q8_K per-256 activation is fine, same as llama.cpp uses).
+
+DEFINITIVE head-to-head (alternating, cool machine, llama.cpp placement log-verified 0/49):
+| round | cpubrrr | llama.cpp CPU |
+|---|---|---|
+| 1 | 93.7 | 87.6 |
+| 2 | 94.4 | 74.7 |
+| 3 | 90.8 | 77.8 |
+| 4 | 89.6 | 86.4 |
+=> cpubrrr ~92 vs llama.cpp ~82. **WE WIN EVERY ROUND on Q4_K — llama.cpp's mature home turf.**
+
+FINAL STANDING — cpubrrr beats llama.cpp CPU on BOTH quant families:
+- gpt-oss:20b (MXFP4): ~55 vs ~14 -> ~4x
+- Qwen3-Coder-30B (Q4_K): ~92 vs ~82 -> ~1.1-1.2x
+Both CPU-only, log-verified, correct output. The Q4_K win = their own algorithm +
+our worker-driven execution model (better core utilization). This supersedes the earlier
+"llama.cpp wins on Q4_K" finding — that was true until we adopted the int-accum kernel.
