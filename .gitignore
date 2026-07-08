@@ -22,3 +22,13 @@ docs/PAPER.md
 docs/PAPER_V2.md
 docs/TEACHING.md
 docs/TEACHING_V2.md
+
+# compiled metal experiment binaries
+metal/gpu_bw
+metal/sync_lat
+metal/sync_lat_c
+metal/sync_lat2
+metal/sync_lat3
+metal/disp_cost
+metal/mmap_bw
+metal/engine_metal

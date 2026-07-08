@@ -383,3 +383,131 @@ FINAL STANDING — cpubrrr beats llama.cpp CPU on BOTH quant families:
 Both CPU-only, log-verified, correct output. The Q4_K win = their own algorithm +
 our worker-driven execution model (better core utilization). This supersedes the earlier
 "llama.cpp wins on Q4_K" finding — that was true until we adopted the int-accum kernel.
+
+---
+
+## 2026-07-08 — GPU PHASE OPENS: what does the GPU actually buy on unified memory?
+
+New question (user): does putting the GPU in the middle double/triple throughput?
+Hypothesis-first, then measured. Machine note: Chrome open during these runs (draft in
+progress) — GPU-side numbers tolerate that; CPU numbers here match the 92 win anyway.
+
+### Hypotheses (stated BEFORE measuring)
+- **H1 decode:** M4 Max = unified memory; CPU + GPU share ~546 GB/s DRAM. Decode is
+  bandwidth-bound, so GPU ceiling = its achievable-bandwidth fraction vs CPU's
+  (~293 GB/s measured). Predict ~1.4-1.6x, NOT 2-3x.
+- **H2 prefill:** compute-bound -> GPU should win big (5-20x).
+- **H3 hybrid:** CPU + GPU concurrently contend for the same DRAM -> combined ≈
+  max(solo), not sum.
+- **H4 headroom:** if Metal-Ollama sits far below the GPU bandwidth ceiling, a
+  hand-written Metal engine could beat it (same playbook as the CPU win).
+
+### E1 — GPU streaming bandwidth (metal/gpu_bw.swift, new)
+| probe | GB/s |
+|---|---|
+| GPU compute read (decode-like) | **486.9** |
+| GPU blit copy | 437.0 |
+| GPU compute copy | 422.6 |
+| CPU cluster (prior measured) | ~293 |
+GPU streams **1.66x** the CPU cluster. That ratio IS the decode story.
+
+### E2 — Ollama Metal GPU baselines (fresh load, log-verified FULL offload)
+| model | decode | prefill | placement |
+|---|---|---|---|
+| gpt-oss:20b | 94.7 / 94.1 | 740 / 748 | 25/25 layers GPU |
+| qwen3-coder:30b | 101.2 / 102.1 | 256-353 | 49/49 layers GPU |
+
+### E3 — ceilings + verdicts
+- qwen effective traffic ≈ 3.1 GB/token (from 92 tok/s @ ~290 GB/s CPU) ->
+  GPU ceiling ≈ 487/3.1 ≈ **155 tok/s**. Ollama Metal = 102 = **66% of ceiling**.
+- gpt-oss ≈ 2.6 GB/token -> ceiling ≈ **185 tok/s**. Ollama Metal = 94 = **~50%**.
+- **H1 CONFIRMED**: GPU-vs-our-CPU decode = 1.1x (qwen, 102 vs 91) and 1.7x
+  (gpt-oss, 94 vs 55). No doubling. Physics, not magic.
+- **H2 CONFIRMED**: prefill 740 GPU vs ~91 CPU (qwen measured 31tok/0.34s) — ~8x,
+  and our CPU prefill is unoptimized.
+- **H4 SUPPORTED**: Metal-Ollama leaves 34-50% of GPU bandwidth on the table.
+  A hand-written Metal engine has real room (predict ~150 qwen / ~180 gpt-oss).
+
+### E4 — hybrid contention test (scripts/bench_hybrid.sh, new) — **H3 REFUTED**
+Solo: cpubrrr CPU 91.3; Ollama GPU 101.7. Concurrent (started together):
+| engine | solo | concurrent | delta |
+|---|---|---|---|
+| Ollama GPU | 101.7 | **99.9** | -2% |
+| cpubrrr CPU | 91.3 | **61.6** | -33% |
+| **combined** | (best single 102) | **161.5** | **1.59x best single** |
+Aggregate DRAM pull ≈ 100x3.1 + 62x3.1 ≈ **~500 GB/s ≈ the SoC's ~546 GB/s ceiling.**
+The fabric genuinely serves both masters: combined throughput is ~84% of the naive
+sum, NOT max(solo). H3 was wrong in the good direction. Caveat: CPU run is short
+(64 tok, ~1s) inside the GPU's 256-tok window; overlap partial — directional, rerun
+longer before quoting externally.
+
+### What this opens (next frontier, in order of ROI)
+1. **Hybrid single-stream decode**: split MoE experts CPU/GPU per token; ceiling =
+   546/3.1 ≈ **~176 tok/s qwen** (1.7x GPU-only). Hard part: per-token sync latency
+   between clusters.
+2. **Own Metal decode kernels**: approach 487 GB/s -> ~150+ solo GPU (beat
+   Metal-Ollama the way we beat CPU-llama.cpp).
+3. **Aggregate serving**: two independent streams (GPU + CPU engine) = ~160 tok/s
+   total on one laptop, today, zero new code.
+
+---
+
+## 2026-07-08 (cont) — G-phase: per-layer hybrid REFUTED; built our own full-GPU engine instead
+
+### G1/G2 — the sync-latency wall (hybrid feasibility gate)
+- Classic dispatch round-trip (commit+wait): **105us median**. Dead for 48 syncs/token.
+- **Persistent-kernel mailbox: IMPOSSIBLE on AGX.** Kernel spinning on a shared-memory
+  atomic never sees CPU stores mid-kernel (and its own stores stay invisible to the CPU
+  — heartbeat counter read 0 the whole run). Writes flush only at command boundaries.
+  Two implementations (Swift, then ObjC with proper C volatile atomics + RMW) both hang.
+  Also learned: Swift -O hoists spin-loop loads (no volatile) — use C for lock-free probes.
+- **MTLSharedEvent ping-pong: 63us round-trip** (p99 98us), data visibility correct
+  (metal/sync_lat3.m). That's the floor.
+- Per-layer FFN split math: FFN ≈ 108us/layer on CPU; best-case parallel saving ≈
+  40us/layer < 63us sync cost. **Single-stream per-layer CPU+GPU hybrid: REFUTED.**
+  Hybrid needs <=10us sync; Apple hardware won't give it.
+
+### Pivot: full-GPU decode engine (metal/engine_metal.m) — sync amortized to 1/token
+Whole qwen3moe forward pass on GPU: ~580 dispatches in ONE command buffer per token,
+weights zero-copy via mmap + newBufferWithBytesNoCopy (verified full-speed: file-backed
+mmap streams at 489 GB/s, metal/mmap_bw.m). Same int-accumulation Q4_K/Q6_K algorithm
+as the CPU win, ported to MSL (carried in float4 fma — products <=15*127 are exact in
+f32). Kernels verified vs CPU scalar reference (rel 5.7e-5 / 3.6e-6) BEFORE the forward
+pass; stage sums then matched engine_qwen2 bit-for-bit through L5 on first run.
+
+**The one bug (and it echoes the CPU build):** first run produced ".SIG" garbage. Stage
+bisection: perfect through L5, x=NaN at L6, all L6 inputs sane, CPU recompute from the
+GPU's own inputs ALSO NaN -> weights, not kernels. `blk.6.ffn_down_exps` is **Q4_K** —
+the down tensors are MIXED Q4_K/Q6_K across layers (24/24; attn_v likewise). We had
+hardcoded Q6_K. LESSON (again): NEVER assume a tensor's quant type; dispatch by the
+manifest's type field per tensor per layer.
+
+### Optimization ladder (KTIME = per-kernel-class GPU ms for 48 layers)
+| step | decode tok/s | what |
+|---|---|---|
+| v1 correct | 40 | scalar-ish kernels, 1 simdgroup/row |
+| vectorized loads | 40 (no change) | uchar4/char4 + float4 fma — NOT ALU-bound |
+| attention two-pass | 55.5 | 10.54 -> 1.30 ms: scores to threadgroup mem, 128 thr/head (old: 1024 threads TOTAL + serial simd_sum chain) |
+| parallel top-k | 74.7 | ktopk was ONE GPU THREAD scanning 128x8; 32-lane simd argmax -> "small" 6.7 -> 2.3 ms |
+| fused rms+quant | (incl above) | krmsq: one dispatch instead of two |
+| kglu4 4-row | 79.1 | activation loads amortized over 8 dot streams |
+| kdown flattened (expert,unit) | 81.6 | independent streams per lane -> ILP |
+| head 4-row + GPU-chained decode | **85.9** | argmax writes outtok[slot], next embed READS it on-GPU; all cmdbufs committed ahead; CPU sync off critical path |
+Also measured: dispatch chains are ~1us each (metal/disp_cost.m) — dispatch count was
+never the bottleneck; occupancy shape was.
+
+### Standing (decode, same prompt, warm)
+| engine | tok/s |
+|---|---|
+| cpubrrr CPU (engine_qwen2) | ~92 |
+| **cpubrrr GPU (engine_metal, ours)** | **~86** |
+| Ollama/llama.cpp Metal (full offload) | ~102 |
+Our first-day Metal engine reaches 84% of llama.cpp's mature Metal path; kernels sit at
+173-260 GB/s vs the 487 ceiling -> clear headroom (qkv+o worst at 173). Both engines
+running together (ours+ours, one laptop): 75.6 + 43.7 ≈ **119 tok/s aggregate**
+(partial-overlap measurement, rerun matched-duration before quoting).
+
+### Open next steps
+- qkv single-dispatch fusion; 2-row middle ground for qkv/o; concurrent-dispatch
+  encoder with stage barriers; target >102 (beat Metal-Ollama), ceiling ~155.
+- GPU prefill for the CPU engine (740 tok/s class) — one handoff, no sync wall.

@@ -14,6 +14,8 @@ use std::time::Instant;
 
 const NT: usize = 12;
 const MAXSEQ: usize = 4096;
+fn dbg_on() -> bool { static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *D.get_or_init(|| std::env::var("CPBRR_DBG").is_ok()) }
+unsafe fn dsum(p: *const f32, n: usize) -> f32 { let mut s = 0.0; for i in 0..n { s += unsafe { *p.add(i) }; } s }
 static TM: [AtomicU64; 5] = [AtomicU64::new(0),AtomicU64::new(0),AtomicU64::new(0),AtomicU64::new(0),AtomicU64::new(0)];
 
 #[derive(Clone, Copy)]
@@ -277,6 +279,7 @@ fn forward_worker(sh: &Shared, wid: usize, ls: &mut bool) {
             }
         }
         bar(sh, ls);
+        if wid == 0 && dbg_on() { eprintln!("DBG embed sum {:.6} x[0..4] {:?} {:?} {:?} {:?}", dsum(sh.x, d), *sh.x, *sh.x.add(1), *sh.x.add(2), *sh.x.add(3)); }
 
         for il in 0..c.nl {
             let ly = &sh.layers[il];
@@ -296,6 +299,7 @@ fn forward_worker(sh: &Shared, wid: usize, ls: &mut bool) {
                 else { let rr = r - nh * hd - nkv * hd; *sh.v.add(rr) = ly.wv.dot(rr, sh.xq, sh.xs, sh.xsum); }
               } }
             bar(sh, ls);
+            if wid == 0 && il == 0 && dbg_on() { eprintln!("DBG L0 qkv q {:.6} k {:.6} v {:.6}", dsum(sh.q, nh*hd), dsum(sh.k, nkv*hd), dsum(sh.v, nkv*hd)); }
             // qk-norm + rope + kv-cache write (parallel over nh+nkv heads)
             { let (a, b) = sl(wid, nh + nkv);
               for h in a..b {
@@ -336,6 +340,7 @@ fn forward_worker(sh: &Shared, wid: usize, ls: &mut bool) {
             // o-proj + residual
             { let (a, b) = sl(wid, d); for r in a..b { *sh.x.add(r) += ly.wo.dot(r, sh.aq, sh.asc, sh.asm); } }
             bar(sh, ls);
+            if wid == 0 && il == 0 && dbg_on() { eprintln!("DBG L0 ao {:.6} x-after-attn {:.6}", dsum(sh.ao, nh*hd), dsum(sh.x, d)); }
             if let Some(t)=_ta { TM[0].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
             let _tr = if wid==0 { Some(Instant::now()) } else { None };
             // ffn rmsnorm
@@ -377,6 +382,7 @@ fn forward_worker(sh: &Shared, wid: usize, ls: &mut bool) {
                 for r in a..b { *sh.x.add(r) += w * ly.down.dot(base + r, hq, hs, hm); }
               } }
             bar(sh, ls);
+            if wid == 0 && (il < 8 || il == c.nl - 1) && dbg_on() { eprintln!("DBG L{il} top {:?} wts {:?} x-after-ffn {:.6}", &top[..], &wts[..], dsum(sh.x, d)); }
             if let Some(t)=_td { TM[2].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
         }
         let _th = if wid==0 { Some(Instant::now()) } else { None };
@@ -391,6 +397,7 @@ fn forward_worker(sh: &Shared, wid: usize, ls: &mut bool) {
         if wid == 0 {
             let mut best = (f32::MIN, 0u32);
             for w in 0..NT { let v = *sh.apart.add(w); let sc = f32::from_bits((v >> 32) as u32); let id = v as u32; if sc > best.0 { best = (sc, id); } }
+            if dbg_on() { eprintln!("DBG head argmax id {} score {:.4}", best.1, best.0); }
             sh.result.store(best.1, Ordering::Relaxed);
         }
         if let Some(t)=_th { TM[3].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
