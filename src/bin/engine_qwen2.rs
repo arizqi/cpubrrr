@@ -533,27 +533,55 @@ fn main() {
     };
 
     let mut ids: Vec<u32> = Vec::new();
-    ids.push(tok("<|im_start|>")); ids.extend(encode("system\nYou are a helpful assistant.")); ids.push(tok("<|im_end|>"));
-    ids.push(tok("<|im_start|>")); ids.extend(encode(&format!("\nuser\n{prompt}"))); ids.push(tok("<|im_end|>"));
-    ids.push(tok("<|im_start|>")); ids.extend(encode("\nassistant\n"));
-    eprintln!("prompt: {} tokens", ids.len());
     let im_end = tok("<|im_end|>");
-    let t1 = Instant::now();
-    let mut next = 0u32;
-    for (i, &t) in ids.iter().enumerate() { next = run(t, i); let _ = i; }
-    eprintln!("prefill {} tok in {:.2}s", ids.len(), t1.elapsed().as_secs_f64());
-    let ngen = 64;
-    let t2 = Instant::now();
-    let mut pos = ids.len();
-    let mut n = 0;
-    for _ in 0..ngen {
-        if next == im_end || next as usize >= ntok { break; }
-        print!("{}", String::from_utf8_lossy(toks[next as usize]));
-        use std::io::Write; std::io::stdout().flush().ok();
-        next = run(next, pos); pos += 1; n += 1;
+    let serve = prompt == "--serve";
+    let ngen: usize = std::env::args().nth(4).and_then(|s| s.parse().ok()).unwrap_or(if serve { 256 } else { 64 });
+
+    // one full generate pass; streams tokens to stdout, returns (n, secs, prefill_s)
+    let generate = |ptext: &str| -> (usize, f64, f64) {
+        let mut ids: Vec<u32> = Vec::new();
+        ids.push(tok("<|im_start|>")); ids.extend(encode("system\nYou are a helpful assistant.")); ids.push(tok("<|im_end|>"));
+        ids.push(tok("<|im_start|>")); ids.extend(encode(&format!("\nuser\n{ptext}"))); ids.push(tok("<|im_end|>"));
+        ids.push(tok("<|im_start|>")); ids.extend(encode("\nassistant\n"));
+        eprintln!("prompt: {} tokens", ids.len());
+        let t1 = Instant::now();
+        let mut next = 0u32;
+        for (i, &t) in ids.iter().enumerate() { next = run(t, i); }
+        let pf = t1.elapsed().as_secs_f64();
+        eprintln!("prefill {} tok in {pf:.2}s", ids.len());
+        let t2 = Instant::now();
+        let mut pos = ids.len();
+        let mut n = 0;
+        for _ in 0..ngen {
+            if next == im_end || next as usize >= ntok { break; }
+            print!("{}", String::from_utf8_lossy(toks[next as usize]));
+            use std::io::Write; std::io::stdout().flush().ok();
+            next = run(next, pos); pos += 1; n += 1;
+        }
+        (n, t2.elapsed().as_secs_f64(), pf)
+    };
+
+    if serve {
+        // demo protocol (matches engine.rs): [READY] on stderr, then per prompt line:
+        // streamed tokens on stdout, then "[STATS] ..." + "[DONE]" lines.
+        eprintln!("[READY]");
+        let stdin = std::io::stdin();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            use std::io::BufRead;
+            if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 { break; }
+            let ptext = line.trim();
+            if ptext.is_empty() { continue; }
+            let (n, dt, pf) = generate(ptext);
+            use std::io::Write;
+            print!("\n[STATS] prefill_tok=0 prefill_s={pf:.3} decode_tok={n} decode_s={dt:.3} tok_s={:.1}\n[DONE]\n", n as f64 / dt);
+            std::io::stdout().flush().ok();
+        }
+    } else {
+        let (n, dt, _) = generate(&prompt);
+        println!("\n---\ndecode: {n} tokens in {dt:.2}s = {:.1} tok/s", n as f64 / dt);
+        let nm=["attn-blk","gate/up","down","head","ffnorm+rtr"];
+        for i in [0,4,1,2,3] { println!("  {:<10} {:.2} ms/tok", nm[i], TM[i].load(Ordering::Relaxed) as f64/1e6/n as f64); }
     }
-    let dt = t2.elapsed().as_secs_f64();
-    println!("\n---\ndecode: {n} tokens in {dt:.2}s = {:.1} tok/s", n as f64 / dt);
-    let nm=["attn-blk","gate/up","down","head","ffnorm+rtr"];
-    for i in [0,4,1,2,3] { println!("  {:<10} {:.2} ms/tok", nm[i], TM[i].load(Ordering::Relaxed) as f64/1e6/n as f64); }
 }

@@ -1167,20 +1167,29 @@ int main(int argc, char **argv) { @autoreleasepool {
     double t2 = now_s();
     uint32_t pos = (uint32_t)ids.count;
     NSMutableArray *cbs = [NSMutableArray arrayWithCapacity:ngen];
-    for (int g = 0; g < ngen; g++) {
-        id<MTLCommandBuffer> cb = [queue commandBuffer];
-        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
-        encEmbed(e, 0, (uint32_t)(g + 1), YES);      // reads outtok[g]
-        for (int il = 0; il < C.nl; il++) encLayer(e, il, pos + g);
-        encHead(e, (uint32_t)(g + 1));               // writes outtok[g+1]
-        [e endEncoding];
-        [cb commit];
-        [cbs addObject:cb];
-    }
+    // rolling window: keep a few buffers queued ahead so encode (~1ms each) hides
+    // inside GPU execution instead of paying ngen x encode upfront (kills short answers),
+    // and EOS stops encoding instead of running the whole tail on stale tokens.
+    __block int committed = 0;
+    void (^commitUpTo)(int) = ^(int upto) {
+        while (committed <= upto && committed < ngen) {
+            int g = committed;
+            id<MTLCommandBuffer> cb = [queue commandBuffer];
+            id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+            encEmbed(e, 0, (uint32_t)(g + 1), YES);      // reads outtok[g]
+            for (int il = 0; il < C.nl; il++) encLayer(e, il, pos + g);
+            encHead(e, (uint32_t)(g + 1));               // writes outtok[g+1]
+            [e endEncoding];
+            [cb commit];
+            [cbs addObject:cb];
+            committed++;
+        }
+    };
     const uint32_t *slots = (const uint32_t *)outtok.contents;
     int n = 0;
     for (int g = 0; g < ngen; g++) {
         if (next == im_end || next >= ntok) break;
+        commitUpTo(g + 3);
         NSData *tt = toks[next];
         fwrite(tt.bytes, 1, tt.length, stdout);
         id<MTLCommandBuffer> cb = cbs[g];
