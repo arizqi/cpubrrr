@@ -14,7 +14,7 @@ hand-tuned home turf.
 
 | model | quant | cpubrrr | llama.cpp CPU | |
 |---|---|---|---|---|
-| **gpt-oss:20b** | MXFP4 | **~55 tok/s** | ~14 tok/s | **~4×** |
+| **gpt-oss:20b** | MXFP4 | **~77 tok/s** | ~14 tok/s | **~5×** |
 | **Qwen3-Coder-30B** | Q4_K/Q6_K | **~92 tok/s** | ~82 tok/s | **~1.1–1.2×** |
 
 Decode throughput, several runs each. Output verified correct in both cases. llama.cpp
@@ -22,9 +22,11 @@ placement confirmed CPU-only from Ollama's own server logs (it defaults to Metal
 macOS — `num_gpu:0` is a *request*, not a fact; see the benchmark-integrity note below).
 
 These numbers replace this repo's earlier, over-optimistic claims (a "7.5× / 110 tok/s"
-headline that did not survive rigorous re-measurement). The story of *how* those
-early numbers were wrong — a contaminated baseline, unverified GPU/CPU placement, and
-thermal throttling — is documented in full, in order, with evidence. We consider that
+headline that did not survive rigorous re-measurement — the reproducible figure is
+~77, recovered from a 52 tok/s regression by fixing dispatch overhead the hard way).
+The story of *how* the early numbers were wrong — a contaminated baseline, unverified
+GPU/CPU placement, thermal throttling, and a thread-pool whose condvar wakeups silently
+cost 7.5 ms/token — is documented in full, in order, with evidence. We consider that
 the most transferable part of the project.
 
 ## Why it's fast
