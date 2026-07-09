@@ -23,8 +23,10 @@ def blob_of(data_dir):
 
 # --- gpt-oss (tab 1) ---
 GPTOSS_ENGINE = os.environ.get("CPUBRRR_ENGINE", os.path.join(ROOT, "target/release/engine"))
+# the engine is config-driven: require config.txt, not just blob_path.txt (a stale
+# pre-config-format data/ dir makes the engine panic at load)
 _gptoss_default = next((d for d in ("data", "data-gpt-oss_20b")
-                        if os.path.exists(os.path.join(ROOT, d, "blob_path.txt"))), "data")
+                        if os.path.exists(os.path.join(ROOT, d, "config.txt"))), "data-gpt-oss_20b")
 GPTOSS_DIR = os.environ.get("CPUBRRR_DATA", os.path.join(ROOT, _gptoss_default))
 GPTOSS_BLOB = os.environ.get("CPUBRRR_BLOB") or blob_of(GPTOSS_DIR)
 # --- qwen (tabs 2/3/4) ---
@@ -54,9 +56,23 @@ class ServeEngine:
                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
             while True:
                 line = self.proc.stderr.readline().decode("utf-8", "replace")
-                if "[READY]" in line or not line:
+                if line.strip():
+                    print(f"[{self.name} warmup] {line.rstrip()}")
+                if "[READY]" in line:
+                    break
+                if not line:
+                    print(f"[{self.name}] DIED during warmup, exit={self.proc.wait()}")
                     break
             print(f"{self.name} ready")
+            # keep draining stderr forever: surfaces panics AND prevents the pipe
+            # buffer from filling (a full pipe blocks the engine mid-generation)
+            def drain(p=self.proc, name=self.name):
+                for l in iter(p.stderr.readline, b""):
+                    s = l.decode("utf-8", "replace").rstrip()
+                    if s:
+                        print(f"[{name} stderr] {s}")
+                print(f"[{name}] process EXITED code={p.wait()}")
+            threading.Thread(target=drain, daemon=True).start()
         return self.proc
 
 gptoss = ServeEngine([GPTOSS_ENGINE, GPTOSS_DIR, GPTOSS_BLOB, "--serve"], "gpt-oss CPU engine") \

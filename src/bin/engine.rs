@@ -453,12 +453,18 @@ fn pool_init() {
             unsafe { pthread_set_qos_class_self_np(0x21, 0); } // USER_INTERACTIVE -> P-cores
             let mut seen = 0u64;
             loop {
-                // spin briefly, then yield (never sleep): dispatch stays ~1-2us and
-                // the OS can still preempt a worker without stalling the pool
+                // tiered wait: spin (hot dispatch ~1-2us) -> yield -> 200us sleeps.
+                // during decode the gap between dispatches is tiny so we stay in the
+                // spin tier; between requests we drop to ~0% CPU instead of pegging
+                // 11 cores (which got the idle serve process killed by the OS)
                 let mut n = 0u32;
                 while shared.seq.load(Ordering::Acquire) == seen {
-                    n += 1;
-                    if n & 1023 != 0 { std::hint::spin_loop(); } else { std::thread::yield_now(); }
+                    n = n.saturating_add(1);
+                    if n < 20_000 {
+                        if n & 1023 != 0 { std::hint::spin_loop(); } else { std::thread::yield_now(); }
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_micros(200));
+                    }
                 }
                 seen = shared.seq.load(Ordering::Acquire);
                 let task = [shared.task[0].load(Ordering::Acquire), shared.task[1].load(Ordering::Acquire)];
