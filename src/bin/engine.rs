@@ -91,7 +91,12 @@ fn sample_logits(logits: &[f32]) -> u32 {
     top.last().unwrap().1
 }
 const KVI: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
-const NT: usize = 12; // worker threads
+// worker threads; overridable via CPBRR_NT for contention experiments
+#[allow(non_snake_case)]
+fn NT() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("CPBRR_NT").ok().and_then(|s| s.parse().ok()).unwrap_or(12))
+}
 static STAGE_NS: [std::sync::atomic::AtomicU64; 8] = [
     std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
@@ -419,46 +424,47 @@ impl SendU8 {
 }
 
 // ---------------- persistent worker pool ----------------
-// Threads park on a condvar; each job is a lifetime-erased &dyn Fn(worker_id).
-// run() blocks until all workers finish, so the borrow stays valid.
+// Spin/yield workers on atomics — measured condvar wakeup on this machine is ~39us
+// per dispatch x ~192 dispatches/token = 7.5 ms/token of pure overhead (the whole
+// "110 -> 55" regression). Workers spin briefly then yield_now (never condvar-sleep
+// on the dispatch path), same fragility fix as engine_qwen2's yielding barrier.
+// Each job is a lifetime-erased &dyn Fn(worker_id); run() blocks until all finish,
+// so the borrow stays valid.
 struct PoolShared {
-    m: std::sync::Mutex<PoolState>,
-    cv_go: std::sync::Condvar,
-    cv_done: std::sync::Condvar,
-}
-struct PoolState {
-    seq: u64,
-    task: [usize; 2],
-    remaining: usize,
+    seq: std::sync::atomic::AtomicU64,
+    task: [std::sync::atomic::AtomicUsize; 2],
+    remaining: std::sync::atomic::AtomicUsize,
 }
 static POOL: std::sync::OnceLock<&'static PoolShared> = std::sync::OnceLock::new();
 
 fn pool_init() {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     let shared: &'static PoolShared = Box::leak(Box::new(PoolShared {
-        m: std::sync::Mutex::new(PoolState { seq: 0, task: [0, 0], remaining: 0 }),
-        cv_go: std::sync::Condvar::new(),
-        cv_done: std::sync::Condvar::new(),
+        seq: AtomicU64::new(0),
+        task: [AtomicUsize::new(0), AtomicUsize::new(0)],
+        remaining: AtomicUsize::new(0),
     }));
-    for wid in 0..NT {
+    // NT()-1 spawned workers; the calling thread executes the last chunk itself in
+    // pool_run, so total hot threads == NT() (a pure-spinning main was a 13th hot
+    // thread on 12 cores -> preemption storm, same failure mode engine_qwen2 hit)
+    for wid in 0..NT() - 1 {
         std::thread::spawn(move || {
+            unsafe extern "C" { fn pthread_set_qos_class_self_np(q: u32, p: i32) -> i32; }
+            unsafe { pthread_set_qos_class_self_np(0x21, 0); } // USER_INTERACTIVE -> P-cores
             let mut seen = 0u64;
             loop {
-                let task;
-                {
-                    let mut st = shared.m.lock().unwrap();
-                    while st.seq == seen {
-                        st = shared.cv_go.wait(st).unwrap();
-                    }
-                    seen = st.seq;
-                    task = st.task;
+                // spin briefly, then yield (never sleep): dispatch stays ~1-2us and
+                // the OS can still preempt a worker without stalling the pool
+                let mut n = 0u32;
+                while shared.seq.load(Ordering::Acquire) == seen {
+                    n += 1;
+                    if n & 1023 != 0 { std::hint::spin_loop(); } else { std::thread::yield_now(); }
                 }
+                seen = shared.seq.load(Ordering::Acquire);
+                let task = [shared.task[0].load(Ordering::Acquire), shared.task[1].load(Ordering::Acquire)];
                 let f: &(dyn Fn(usize) + Sync) = unsafe { std::mem::transmute(task) };
                 f(wid);
-                let mut st = shared.m.lock().unwrap();
-                st.remaining -= 1;
-                if st.remaining == 0 {
-                    shared.cv_done.notify_one();
-                }
+                shared.remaining.fetch_sub(1, Ordering::AcqRel);
             }
         });
     }
@@ -466,24 +472,27 @@ fn pool_init() {
 }
 
 fn pool_run(f: &(dyn Fn(usize) + Sync)) {
+    use std::sync::atomic::Ordering;
     let shared = POOL.get().unwrap();
     let fat: [usize; 2] = unsafe { std::mem::transmute(f as *const (dyn Fn(usize) + Sync)) };
-    let mut st = shared.m.lock().unwrap();
-    st.task = fat;
-    st.seq += 1;
-    st.remaining = NT;
-    shared.cv_go.notify_all();
-    while st.remaining > 0 {
-        st = shared.cv_done.wait(st).unwrap();
+    shared.task[0].store(fat[0], Ordering::Release);
+    shared.task[1].store(fat[1], Ordering::Release);
+    shared.remaining.store(NT() - 1, Ordering::Release);
+    shared.seq.fetch_add(1, Ordering::Release);
+    f(NT() - 1); // main thread works the last chunk instead of idling
+    let mut n = 0u32;
+    while shared.remaining.load(Ordering::Acquire) > 0 {
+        n += 1;
+        if n & 1023 != 0 { std::hint::spin_loop(); } else { std::thread::yield_now(); }
     }
 }
 
 fn par_rows<F: Fn(usize, usize) + Sync>(n: usize, f: F) {
     if POOL.get().is_none() {
         // pre-init fallback (used during weight quantization at load)
-        let chunk = (n + NT - 1) / NT;
+        let chunk = (n + NT() - 1) / NT();
         std::thread::scope(|s| {
-            for t in 0..NT {
+            for t in 0..NT() {
                 let a = t * chunk;
                 if a >= n {
                     break;
@@ -495,14 +504,18 @@ fn par_rows<F: Fn(usize, usize) + Sync>(n: usize, f: F) {
         });
         return;
     }
-    let chunk = (n + NT - 1) / NT;
-    pool_run(&|t: usize| {
-        let a = t * chunk;
+    // work-stealing: threads grab small chunks from a shared counter, so fast
+    // P-cores absorb what slow E-cores can't — static n/NT chunking made every
+    // stage wait on the two E-core stragglers (~30% stage inflation)
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let ctr = AtomicUsize::new(0);
+    let chunk = ((n + NT() * 3 - 1) / (NT() * 3)).max(1);
+    pool_run(&|_t: usize| loop {
+        let a = ctr.fetch_add(chunk, Ordering::Relaxed);
         if a >= n {
             return;
         }
-        let b = (a + chunk).min(n);
-        f(a, b);
+        f(a, (a + chunk).min(n));
     });
 }
 
@@ -620,8 +633,14 @@ fn main() {
     let mut kc = vec![vec![0f32; MAXSEQ * cfg().nkv * cfg().hd]; cfg().nl];
     let mut vc = vec![vec![0f32; MAXSEQ * cfg().nkv * cfg().hd]; cfg().nl];
 
+    // scratch buffers reused across layers/tokens (per-layer vec! zeroing cost real)
+    let mut gu = vec![0f32; cfg().topk * 2 * cfg().d];
+    let mut hq = vec![0i8; cfg().topk * cfg().d];
+    let mut hs = vec![0f32; cfg().topk * cfg().blocks];
+    let mut ffn4 = vec![0f32; cfg().topk * cfg().d];
     // forward one token; returns logits argmax if want_logits
     let mut forward = |tok: u32, pos: usize, want: bool, kc: &mut Vec<Vec<f32>>, vc: &mut Vec<Vec<f32>>| -> u32 {
+        let (gu, hq, hs, ffn4) = (&mut gu, &mut hq, &mut hs, &mut ffn4);
         let mut x: Vec<f32> = (0..cfg().d)
             .map(|j| {
                 let bits = (unsafe { *tok_embd.0.add(tok as usize * cfg().d + j) } as u32) << 16;
@@ -742,15 +761,23 @@ fn main() {
             let _t = Tick::new(5);
             // ---- MoE FFN ----
             let xn2 = rmsnorm(&x, &ly.ffn_norm);
-            let logits: Vec<f32> = (0..cfg().ne)
-                .map(|e| {
-                    let mut a = ly.ginp_b[e];
-                    for j in 0..cfg().d {
-                        a += ly.ginp[e * cfg().d + j] * xn2[j];
+            // parallel + slice-zip (bounds-check-free -> autovectorizes); the old
+            // serial indexed loop was ~2.2 ms/token across 24 layers
+            let mut logits = vec![0f32; cfg().ne];
+            {
+                let out = SendPtr(logits.as_mut_ptr());
+                let xn2 = &xn2;
+                par_rows(cfg().ne, |a, b| {
+                    for e in a..b {
+                        let row = &ly.ginp[e * cfg().d..(e + 1) * cfg().d];
+                        let mut acc = ly.ginp_b[e];
+                        for (w, x) in row.iter().zip(xn2.iter()) {
+                            acc += w * x;
+                        }
+                        unsafe { *out.get().add(e) = acc };
                     }
-                    a
-                })
-                .collect();
+                });
+            }
             let mut order: Vec<usize> = (0..cfg().ne).collect();
             order.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
             let top = &order[..cfg().topk];
@@ -762,7 +789,7 @@ fn main() {
             drop(_t);
             let _t = Tick::new(6);
             let (xq, xs) = quant_i8(&xn2);
-            let mut gu = vec![0f32; cfg().topk * 2 * cfg().d];
+            // gu reused (hoisted scratch)
             {
                 let out = SendPtr(gu.as_mut_ptr());
                 let (xq, xs, top) = (&xq, &xs, &top);
@@ -794,26 +821,42 @@ fn main() {
             }
             const ALPHA: f32 = 1.702;
             const LIM: f32 = 7.0;
-            let mut hq = vec![0i8; cfg().topk * cfg().d];
-            let mut hs = vec![0f32; cfg().topk * cfg().blocks];
-            for ei in 0..cfg().topk {
-                let g = &gu[ei * 2 * cfg().d..ei * 2 * cfg().d + cfg().d];
-                let u = &gu[ei * 2 * cfg().d + cfg().d..ei * 2 * cfg().d + 2 * cfg().d];
-                let h: Vec<f32> = (0..cfg().d)
-                    .map(|k| {
-                        let xg = g[k].min(LIM);
-                        let yu = u[k].clamp(-LIM, LIM);
-                        (xg / (1.0 + (-ALPHA * xg).exp())) * (yu + 1.0)
-                    })
-                    .collect();
-                let (q8, s8) = quant_i8(&h);
-                hq[ei * cfg().d..(ei + 1) * cfg().d].copy_from_slice(&q8);
-                hs[ei * cfg().blocks..(ei + 1) * cfg().blocks].copy_from_slice(&s8);
+            // act + Q8 quant, parallel over (expert, 32-block) — the old serial loop
+            // was ~11.5k exp() calls per layer on the main thread (~3-4 ms/token)
+            // hq/hs reused (hoisted scratch)
+            {
+                let nb = cfg().d / 32;
+                let (hqp, hsp) = (SendPtr(hq.as_mut_ptr() as *mut f32), SendPtr(hs.as_mut_ptr()));
+                let gu = &gu;
+                par_rows(cfg().topk * nb, |a, b| {
+                    for it in a..b {
+                        let (ei, blk) = (it / nb, it % nb);
+                        let g = &gu[ei * 2 * cfg().d + blk * 32..ei * 2 * cfg().d + blk * 32 + 32];
+                        let u = &gu[ei * 2 * cfg().d + cfg().d + blk * 32..ei * 2 * cfg().d + cfg().d + blk * 32 + 32];
+                        let mut h = [0f32; 32];
+                        let mut amax = 1e-12f32;
+                        for k in 0..32 {
+                            let xg = g[k].min(LIM);
+                            let yu = u[k].clamp(-LIM, LIM);
+                            let v = (xg / (1.0 + (-ALPHA * xg).exp())) * (yu + 1.0);
+                            h[k] = v;
+                            amax = amax.max(v.abs());
+                        }
+                        let sc = amax / 127.0;
+                        unsafe {
+                            *hsp.get().add(ei * cfg().blocks + blk) = sc;
+                            let qp = (hqp.get() as *mut i8).add(ei * cfg().d + blk * 32);
+                            for k in 0..32 {
+                                *qp.add(k) = (h[k] / sc).round().clamp(-127.0, 127.0) as i8;
+                            }
+                        }
+                    }
+                });
             }
             drop(_t);
             let _t = Tick::new(7);
             // down-proj: single fused pass, 4 experts to disjoint buffers, weighted
-            let mut ffn4 = vec![0f32; cfg().topk * cfg().d];
+            // ffn4 reused (hoisted scratch); down-pass overwrites all topk*d slots
             {
                 let contrib = SendPtr(ffn4.as_mut_ptr());
                 let (hq, hs, top, wts) = (&hq, &hs, &top, &wts);
@@ -862,9 +905,9 @@ fn main() {
         let mut logits = vec![0f32; cfg().nvocab];
         {
             let lp = logits.as_mut_ptr() as usize;
-            let chunk = (cfg().nvocab + NT - 1) / NT;
+            let chunk = (cfg().nvocab + NT() - 1) / NT();
             std::thread::scope(|s| {
-                for t in 0..NT {
+                for t in 0..NT() {
                     let a = t * chunk;
                     let b = ((t + 1) * chunk).min(cfg().nvocab);
                     let (xq, xs, head) = (&xq, &xs, &head);
@@ -1147,9 +1190,9 @@ fn main() {
         let mut logits = vec![0f32; cfg().nvocab];
         {
             let lp = logits.as_mut_ptr() as usize;
-            let chunk = (cfg().nvocab + NT - 1) / NT;
+            let chunk = (cfg().nvocab + NT() - 1) / NT();
             std::thread::scope(|sc| {
-                for t in 0..NT {
+                for t in 0..NT() {
                     let a = t * chunk;
                     let b2 = ((t + 1) * chunk).min(cfg().nvocab);
                     let (xq2, xs2, head) = (&xq2, &xs2, &head);
@@ -1247,6 +1290,8 @@ fn main() {
             forward_batch(&ids, 0, &mut kc, &mut vc)
         };
         let prefill_s = t1.elapsed().as_secs_f64();
+        // reset stage counters so the printed profile reflects DECODE only
+        for s in &STAGE_NS { s.store(0, std::sync::atomic::Ordering::Relaxed); }
 
         let ngen = if req_ngen > 0 { req_ngen } else if serve { 256 } else { 96 };
         let t2 = Instant::now();

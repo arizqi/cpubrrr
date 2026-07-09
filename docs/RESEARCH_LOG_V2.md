@@ -511,3 +511,47 @@ running together (ours+ours, one laptop): 75.6 + 43.7 ≈ **119 tok/s aggregate*
 - qkv single-dispatch fusion; 2-row middle ground for qkv/o; concurrent-dispatch
   encoder with stage barriers; target >102 (beat Metal-Ollama), ceiling ~155.
 - GPU prefill for the CPU engine (740 tok/s class) — one handoff, no sync wall.
+
+---
+
+## 2026-07-09 — THE "110 -> 55" MYSTERY: solved enough, and a 52 -> 77 recovery
+
+User rebooted to chase the gpt-oss regression. Systematic elimination on a FRESH,
+COOL, 91%-idle machine:
+- reboot/thermal: REFUTED (still 54 after fresh boot, cold chip)
+- power: found a 30W charger + 28% battery (M4 Max needs ~90W+ under load) — plausible!
+  but REFUTED: at 94W wall power, still 52
+- code: REFUTED again, properly this time (initial-release commit in a worktree on the
+  clean machine: 57.3)
+- OS: no update since January
+- machine: EXONERATED — bench_moe still streams 294 GB/s (projects ~185 tok/s)
+
+So the gap was engine-side all along. Root causes found and fixed, in order:
+
+| fix | tok/s |
+|---|---|
+| (start, clean machine) | 52 |
+| **condvar pool -> spin/yield pool** (measured: condvar dispatch = 39us x ~192/token = **7.5 ms/token of pure wakeup overhead**; pool_lat.rs) | 66.5 (NT sweep: 13 hot threads = preemption storm; main thread now works a chunk instead of spinning) |
+| **router: serial scalar 92k MACs -> par_rows + slice-zip** (bounds checks had killed autovectorization; was 2.2 ms/token) | 74.5 |
+| **act+quant: serial 11.5k exp()/layer on main thread -> parallel over (expert, 32-block)** | 77 |
+| work-stealing par_rows chunks (P-cores absorb E-core lag) + hoisted per-layer scratch allocs | 77 (neutral-to-small, kept for robustness) |
+
+Output verified identical (same Rayleigh sentence, greedy) after every change.
+
+**On the original "110":** decode-only stage profile today: experts (gate/up+down)
+6.0 ms/token at 210 GB/s — MATCHING E17's expert budget. But E17's claimed 9.1 ms
+total requires attn+qkv+o+head+glue in ~3 ms, while those stages measure ~6 ms of
+bandwidth-bound Q8 traffic today. E17's total doesn't close against its own
+components as measured now. Verdict: 110 is not reproducible in this configuration
+and its composition can't be reconstructed; **77 tok/s is the honest, reproducible,
+clean-machine number** (5.3x llama.cpp CPU's ~14).
+
+LESSON (benchmark-integrity #4 and #5):
+4. Check the WALL SOCKET: a 30W charger on a 90W laptop silently halves peak CPU
+   clocks. It wasn't the cause here but it WILL be someone's 2x mystery.
+5. A historical peak you can't reproduce is not a baseline. Log enough environment
+   (charger wattage, battery %, load, thermals, exact binary hash + data hash) that
+   future-you can either reproduce a number or retire it. We now retire "110".
+
+Sub-lesson: condvar wakeup latency is not a constant of nature — 39us today vs
+implied ~10us on 07-04, same OS build. Spin/yield pools remove that variable.
