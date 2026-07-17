@@ -1,5 +1,9 @@
 # cpubrrr
 
+
+https://github.com/user-attachments/assets/a390cb6e-86b8-41e5-9ef6-957c94dabe19
+
+
 **From-scratch CPU-only LLM inference that beats llama.cpp's CPU path — on both quant formats it runs, no GPU.**
 
 `cpubrrr` is a research runtime that runs frontier-class **mixture-of-experts** models
