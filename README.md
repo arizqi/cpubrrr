@@ -133,7 +133,7 @@ number if any layers ran on the GPU.
 ## Benchmark integrity (read this before quoting numbers)
 
 Bandwidth-bound CPU benchmarks are easy to get wrong, and this project got them wrong
-three times before getting them right:
+four times before getting them right:
 
 1. **Contaminated baseline** — the first llama.cpp number was measured while a 65 GB
    download ate memory bandwidth in the background.
@@ -142,10 +142,32 @@ three times before getting them right:
    layers to GPU`) reveals the truth.
 3. **Thermal throttling** — after days of load the *same binary* gave 66 → 42 → 5 tok/s
    on back-to-back runs.
+4. **An unreproducible peak** — an early "110 tok/s" headline would not reproduce on a
+   clean machine and was retired. Chasing it also surfaced two more traps: check your
+   charger (a 30 W brick on a ~90 W laptop silently halves clocks — not our bug, but
+   it will be someone's), and a historical peak you can't reproduce is not a baseline.
+   Log enough environment to reproduce a number, or retire it.
 
 cpubrrr also saturates all 12 cores, so its peak needs a quiet machine; llama.cpp
 tolerates background load and heat better. Meta-lesson: **be more skeptical of
 benchmarks that flatter you, not less.** Re-verify on your own hardware.
+
+## Contributing — the mission needs hands
+
+The goal is bigger than this repo: free and cheap models deserve kernel-level-up tooling
+so fast reasoning is available on hardware people already own. The highest-impact open
+work, in order:
+
+1. **[Port the decode kernels to x86 (AVX-512 / VNNI)](https://github.com/arizqi/cpubrrr/issues/1)** —
+   the #1 ask. The win is algorithmic, not Apple-specific; `sdot` maps to `vpdpbusd`.
+2. **[Benchmark llama.cpp BLAS builds (BLIS / oneAPI / OpenBLAS)](https://github.com/arizqi/cpubrrr/issues/2)** —
+   a self-contained measurement task, good first contribution.
+3. **[Improve prefill throughput](https://github.com/arizqi/cpubrrr/issues/3)** — the one
+   place llama.cpp still beats us; compute-bound GEMM, different problem than decode.
+
+House rules are short (see [CONTRIBUTING.md](CONTRIBUTING.md)): verify kernels against an
+oracle before wiring them in, and land every perf claim with before/after numbers in the
+research log. Beating our numbers is a welcome contribution.
 
 ## Status & honest limits
 
