@@ -130,6 +130,20 @@ Each is a standalone binary (`cargo build --release`, then `./target/release/<na
 Ollama's server log to confirm actual GPU/CPU placement** — it refuses to report a "CPU"
 number if any layers ran on the GPU.
 
+## Correctness parity (fast AND right)
+
+An engine can't make a model smarter — but a broken engine can make it dumber. So we
+run real benchmarks through cpubrrr and through Ollama/llama.cpp on the *same quantized
+weights*, same prompts, greedy decoding, same answer extraction
+(`scripts/parity_eval.py`):
+
+| benchmark | model | cpubrrr | Ollama/llama.cpp | delta |
+|---|---|---|---|---|
+| GSM8K (100 q) | Qwen3-Coder-30B Q4_K | **89.0%** | 87.0% | +2.0 (within noise) |
+
+Deltas within ±3 points at n=100 are sampling noise; the claim is *parity*, not
+superiority. The speed does not come from corrupted math.
+
 ## Benchmark integrity (read this before quoting numbers)
 
 Bandwidth-bound CPU benchmarks are easy to get wrong, and this project got them wrong

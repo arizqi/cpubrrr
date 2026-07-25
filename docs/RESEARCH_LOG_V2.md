@@ -555,3 +555,25 @@ LESSON (benchmark-integrity #4 and #5):
 
 Sub-lesson: condvar wakeup latency is not a constant of nature — 39us today vs
 implied ~10us on 07-04, same OS build. Spin/yield pools remove that variable.
+
+---
+
+## 2026-07-25 — Correctness parity: GSM8K through the engine
+
+New harness (`scripts/parity_eval.py`): run benchmark questions through cpubrrr's warm
+--serve engines AND through Ollama on the same quantized weights, same prompts, greedy,
+same answer extraction. Purpose: prove the speed isn't paid for with corrupted math.
+
+Method notes:
+- Token budgets must MATCH (first attempt: ours capped at 256 vs ollama 320 -> a
+  truncated answer scored as "wrong". Matched at 320 both sides.)
+- Chat templating differs slightly between our engine and ollama's (system prompt
+  wording); acceptable for a parity claim, noted here for honesty.
+
+Result, Qwen3-Coder-30B (Q4_K), GSM8K n=100:
+| engine | score |
+|---|---|
+| cpubrrr (CPU) | 89/100 |
+| Ollama (same weights) | 87/100 |
++2.0 points = within sampling noise (stderr ~3.3 at n=100). PARITY CONFIRMED.
+gpt-oss:20b run queued; will append.
