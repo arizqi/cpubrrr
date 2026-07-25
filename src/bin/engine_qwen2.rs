@@ -112,6 +112,55 @@ unsafe fn q4k_dot(row: *const u8, xq: *const i8, ys: *const f32, xsum32: *const 
         sumf
     }
 }
+/// k-wide Q4_K dot: read each weight row ONCE, dot against k activation vectors.
+/// This is the speculative-decoding / batched-prefill primitive: the marginal cost
+/// of activations 2..k is compute only — the bandwidth (weight stream) is shared.
+/// k <= 8. Outputs one f32 per activation vector.
+unsafe fn q4k_dot_k(row: *const u8, xqs: &[*const i8], yss: &[*const f32],
+                    xsums: &[*const i32], cols: usize, out: &mut [f32]) {
+    unsafe {
+        let k = xqs.len();
+        debug_assert!(k <= 8 && out.len() >= k);
+        let mask = vdupq_n_u8(0x0F);
+        let mut sumf = [0f32; 8];
+        for sb in 0..cols / 256 {
+            let b = row.add(sb * 144);
+            let d = half_to_f32(u16::from_le_bytes([*b, *b.add(1)]));
+            let dmin = half_to_f32(u16::from_le_bytes([*b.add(2), *b.add(3)]));
+            let (sc, mn) = unpack_k4(b.add(4));
+            let qs = b.add(16);
+            let mut acc = [vdupq_n_s32(0); 8];
+            for jj in 0..4 {
+                let (j0, j1) = (jj * 2, jj * 2 + 1);
+                let (blk0, blk1) = (sb * 8 + j0, sb * 8 + j1);
+                // weight bytes loaded ONCE per jj, reused across all k activations
+                let w0 = vld1q_u8(qs.add(jj * 32));
+                let w1 = vld1q_u8(qs.add(jj * 32 + 16));
+                let lo0 = vreinterpretq_s8_u8(vandq_u8(w0, mask));
+                let lo1 = vreinterpretq_s8_u8(vandq_u8(w1, mask));
+                let hi0 = vreinterpretq_s8_u8(vshrq_n_u8::<4>(w0));
+                let hi1 = vreinterpretq_s8_u8(vshrq_n_u8::<4>(w1));
+                for t in 0..k {
+                    let xq = xqs[t];
+                    let s0 = sdot(sdot(vdupq_n_s32(0), lo0, vld1q_s8(xq.add(blk0 * 32))),
+                                  lo1, vld1q_s8(xq.add(blk0 * 32 + 16)));
+                    let s1 = sdot(sdot(vdupq_n_s32(0), hi0, vld1q_s8(xq.add(blk1 * 32))),
+                                  hi1, vld1q_s8(xq.add(blk1 * 32 + 16)));
+                    acc[t] = vmlaq_n_s32(acc[t], s0, sc[j0] as i32);
+                    acc[t] = vmlaq_n_s32(acc[t], s1, sc[j1] as i32);
+                }
+            }
+            for t in 0..k {
+                let mut mint = 0i32;
+                for j in 0..8 { mint += mn[j] as i32 * *xsums[t].add(sb * 8 + j); }
+                let ysb = *yss[t].add(sb);
+                sumf[t] += ysb * d * vaddvq_s32(acc[t]) as f32 - ysb * dmin * mint as f32;
+                acc[t] = vdupq_n_s32(0);
+            }
+        }
+        out[..k].copy_from_slice(&sumf[..k]);
+    }
+}
 unsafe fn q6k_dot(row: *const u8, xq: *const i8, ys: *const f32, cols: usize) -> f32 {
     unsafe {
         let mut sumf = 0f32;
@@ -486,6 +535,44 @@ fn main() {
     let raw: &'static Raw = Box::leak(Box::new(raw));
     let _ = raw;
     eprintln!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
+
+    if std::env::var("CPBRR_VERIFYK").is_ok() {
+        // k-wide kernel vs k independent single dots on real weights (blk.0 wq)
+        unsafe {
+            let k = 6usize;
+            let nb = c.d / 32;
+            let mut xq = vec![0i8; c.d * k];
+            let mut xs = vec![0f32; (c.d / 256) * k];
+            let mut xm = vec![0i32; nb * k];
+            let mut seed = 0x12345678u32;
+            let mut rnd = || { seed = seed.wrapping_mul(1664525).wrapping_add(1013904223); seed };
+            for t in 0..k {
+                let x: Vec<f32> = (0..c.d).map(|_| (rnd() as f32 / u32::MAX as f32) - 0.5).collect();
+                for sb in 0..c.d / 256 {
+                    qblock(x.as_ptr(), xq.as_mut_ptr().add(t * c.d), xs.as_mut_ptr().add(t * (c.d / 256)),
+                           xm.as_mut_ptr().add(t * nb), sb);
+                }
+            }
+            let xqs: Vec<*const i8> = (0..k).map(|t| xq.as_ptr().add(t * c.d) as *const i8).collect();
+            let yss: Vec<*const f32> = (0..k).map(|t| xs.as_ptr().add(t * (c.d / 256)) as *const f32).collect();
+            let xms: Vec<*const i32> = (0..k).map(|t| xm.as_ptr().add(t * nb) as *const i32).collect();
+            let w = &layers[0].wq;
+            let mut maxrel = 0f32;
+            let mut outk = [0f32; 8];
+            for r in 0..32 {
+                let rp = w.ptr.add(r * w.bpr);
+                q4k_dot_k(rp, &xqs, &yss, &xms, w.cols, &mut outk);
+                for t in 0..k {
+                    let single = q4k_dot(rp, xqs[t], yss[t], xms[t], w.cols);
+                    let rel = (outk[t] - single).abs() / (single.abs() + 1e-6);
+                    maxrel = maxrel.max(rel);
+                }
+            }
+            println!("verifyk q4k_dot_k (k={k}) vs single dots: max rel err {maxrel:.2e}  {}",
+                     if maxrel < 1e-5 { "PASS" } else { "FAIL" });
+            std::process::exit(if maxrel < 1e-5 { 0 } else { 1 });
+        }
+    }
 
     // allocate activation buffers (leaked, reused across tokens)
     let mk_f = |n: usize| Box::leak(vec![0f32; n].into_boxed_slice()).as_mut_ptr();

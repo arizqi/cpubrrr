@@ -607,3 +607,44 @@ Honest rerun (n=100, 1024-token budget):
 LESSON #5: when comparing reasoning models, the token budget must be large enough that
 NEITHER side truncates mid-thinking — otherwise you're measuring template verbosity,
 not correctness. We nearly published a fake +47.
+
+---
+
+## 2026-07-25 — Speculative decoding: design (S-phase)
+
+Goal: push qwen3-coder decode past 92 tok/s on the SAME hardware by generating
+multiple tokens per weight-streaming pass.
+
+**Why it can work here:** decode is bandwidth-bound — one token costs one full read of
+the active weights (~3.1 GB). If we can verify k drafted tokens in ONE pass that reads
+the weights once (k dot-products per weight row instead of 1), the marginal cost of
+tokens 2..k is nearly free. Accepted-token rate then multiplies throughput.
+
+**Draft source — prompt-lookup (n-gram), not a draft model:**
+- gpt-oss has no small tokenizer-compatible sibling; qwen does (0.6B) but that needs a
+  whole dense-arch engine. Instead: propose continuations by matching the last m tokens
+  against earlier context and copying what followed (prompt-lookup decoding).
+- Perfect fit for CODE generation (qwen-coder's job): identifiers, imports, repeated
+  patterns -> high accept rates expected. Zero extra memory, zero extra model.
+
+**Verify pass — k-wide batched forward:**
+- New kernel variants: each weight row is read ONCE and dotted against k activation
+  vectors (k int8 xq buffers), k accumulators. k=4..8.
+- Attention: causal within the k-block (position i attends to cache + drafted tokens
+  < i). KV appended provisionally, truncated on rejection.
+- Head: argmax per position; accept longest prefix where argmax(target) == draft.
+- SAME kernels double as the prefill fix (issue #3) — batch-of-k forward is the
+  shared machinery.
+
+**Expected ceiling math:** verify pass of k=6 costs ~1.15x a single-token pass
+(bandwidth-wise). With accept rate a (avg accepted per pass = A): throughput ~= 92 *
+A / 1.15. A=2 -> ~160 tok/s; A=3 -> ~240. Code prompts should sit between.
+
+Plan: S1 k-wide q4k/q6k kernels + oracle verify; S2 k-wide forward in engine_qwen2;
+S3 prompt-lookup draft + accept loop + stats; S4 honest bench (code + prose prompts —
+prose will be worse, report both).
+
+S1 DONE: q4k_dot_k (k<=8) in engine_qwen2 — weight bytes loaded once per superblock,
+k sdot streams, k accumulators. Verified BIT-EXACT (max rel 0.00e0) vs k independent
+q4k_dot calls on real blk.0 wq rows (CPBRR_VERIFYK=1). Next: S2 k-wide forward pass,
+S3 prompt-lookup draft + accept loop, S4 honest bench (code AND prose prompts).
