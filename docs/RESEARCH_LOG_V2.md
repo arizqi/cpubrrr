@@ -577,3 +577,12 @@ Result, Qwen3-Coder-30B (Q4_K), GSM8K n=100:
 | Ollama (same weights) | 87/100 |
 +2.0 points = within sampling noise (stderr ~3.3 at n=100). PARITY CONFIRMED.
 gpt-oss:20b run queued; will append.
+
+## 2026-07-25 — OpenAI-compatible API server (adoption unlock)
+
+scripts/openai_server.py: stdlib-only HTTP server exposing the warm --serve engines as
+/v1/models + /v1/chat/completions (streaming SSE + non-streaming, max_tokens, usage
+with tok_s). engine_qwen2 taught the TSV request protocol (per-request ngen; temp/seed
+accepted-but-ignored, greedy-only — documented). Multi-turn flattened into the prompt.
+Verified: models list, haiku completion with usage, correct SSE delta stream.
+Purpose: cpubrrr now drops into any tool that speaks the OpenAI API.

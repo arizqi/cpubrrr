@@ -532,13 +532,12 @@ fn main() {
         sh.result.load(Ordering::Relaxed)
     };
 
-    let mut ids: Vec<u32> = Vec::new();
     let im_end = tok("<|im_end|>");
     let serve = prompt == "--serve";
     let ngen: usize = std::env::args().nth(4).and_then(|s| s.parse().ok()).unwrap_or(if serve { 256 } else { 64 });
 
     // one full generate pass; streams tokens to stdout, returns (n, secs, prefill_s)
-    let generate = |ptext: &str| -> (usize, f64, f64) {
+    let generate = |ptext: &str, ngen: usize| -> (usize, f64, f64) {
         let mut ids: Vec<u32> = Vec::new();
         ids.push(tok("<|im_start|>")); ids.extend(encode("system\nYou are a helpful assistant.")); ids.push(tok("<|im_end|>"));
         ids.push(tok("<|im_start|>")); ids.extend(encode(&format!("\nuser\n{ptext}"))); ids.push(tok("<|im_end|>"));
@@ -573,13 +572,24 @@ fn main() {
             if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 { break; }
             let ptext = line.trim();
             if ptext.is_empty() { continue; }
-            let (n, dt, pf) = generate(ptext);
+            // accept engine.rs's TSV form `temp \t seed \t ngen \t prompt` for protocol
+            // parity with the OpenAI server; this engine is greedy-only, so temp/seed
+            // are accepted and ignored (documented), ngen is honored per-request
+            let (req_ngen, ptext) = {
+                let parts: Vec<&str> = ptext.splitn(4, '\t').collect();
+                if parts.len() == 4 {
+                    if let Ok(ng) = parts[2].parse::<usize>() {
+                        (Some(ng), parts[3].replace("\\n", " ").replace("\\t", " "))
+                    } else { (None, ptext.to_string()) }
+                } else { (None, ptext.to_string()) }
+            };
+            let (n, dt, pf) = generate(&ptext, req_ngen.unwrap_or(ngen));
             use std::io::Write;
             print!("\n[STATS] prefill_tok=0 prefill_s={pf:.3} decode_tok={n} decode_s={dt:.3} tok_s={:.1}\n[DONE]\n", n as f64 / dt);
             std::io::stdout().flush().ok();
         }
     } else {
-        let (n, dt, _) = generate(&prompt);
+        let (n, dt, _) = generate(&prompt, ngen);
         println!("\n---\ndecode: {n} tokens in {dt:.2}s = {:.1} tok/s", n as f64 / dt);
         let nm=["attn-blk","gate/up","down","head","ffnorm+rtr"];
         for i in [0,4,1,2,3] { println!("  {:<10} {:.2} ms/tok", nm[i], TM[i].load(Ordering::Relaxed) as f64/1e6/n as f64); }

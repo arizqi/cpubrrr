@@ -104,6 +104,20 @@ cargo build --release
 ./target/release/engine data-gpt-oss_20b "$(cat data-gpt-oss_20b/blob_path.txt)" "Why is the sky blue?"
 ```
 
+### Use it with your existing tools (OpenAI-compatible API)
+
+```bash
+python3 scripts/openai_server.py          # serves http://localhost:8643/v1
+```
+
+Point any OpenAI-compatible client (chat UIs, IDE plugins, agent frameworks) at
+`http://localhost:8643/v1`. Implements `/v1/models` and `/v1/chat/completions`
+(streaming and non-streaming, `max_tokens`, usage accounting — the response even
+tells you its tok/s). Honest limits: multi-turn history is flattened into the
+prompt (engines apply their own chat template), temperature is honored by the
+gpt-oss engine and ignored (greedy) by the qwen engine, and it serves one request
+at a time — the engine owns all your cores anyway.
+
 ### Side-by-side demo
 
 A local web page streams cpubrrr vs. llama.cpp/Ollama (CPU) with live tok/s counters:
