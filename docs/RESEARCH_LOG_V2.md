@@ -586,3 +586,24 @@ with tok_s). engine_qwen2 taught the TSV request protocol (per-request ngen; tem
 accepted-but-ignored, greedy-only — documented). Multi-turn flattened into the prompt.
 Verified: models list, haiku completion with usage, correct SSE delta stream.
 Purpose: cpubrrr now drops into any tool that speaks the OpenAI API.
+
+## 2026-07-25 (cont) — gpt-oss parity + benchmark-integrity lesson #5
+
+First gpt-oss GSM8K run (n=100, 320-token budget): cpubrrr 82% vs ollama 35% =
+**+47 points. Reflex: numbers that flatter us are suspect.** Probe: ollama's gpt-oss
+returns a separate `thinking` channel; on hard questions it ate the 320-token budget
+before the final answer line on ollama's side (our engine's template pins
+"Reasoning: low" so ours mostly fit). The +47 was a TRUNCATION ARTIFACT, not engine
+quality. Fix: --npred flag, budgets matched at 1024 both sides, TSV protocol used for
+per-request ngen on both engines.
+
+Honest rerun (n=100, 1024-token budget):
+| engine | score |
+|---|---|
+| cpubrrr (CPU) | 98/100 |
+| Ollama (same weights) | 94/100 |
++4.0 = edge of noise. PARITY CONFIRMED on both model families.
+
+LESSON #5: when comparing reasoning models, the token budget must be large enough that
+NEITHER side truncates mid-thinking — otherwise you're measuring template verbosity,
+not correctness. We nearly published a fake +47.

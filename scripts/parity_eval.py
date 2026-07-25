@@ -69,9 +69,10 @@ def norm(x):
 
 class CpubrrrServe:
     """Warm --serve engine speaking the [READY]/[STATS]/[DONE] protocol."""
-    def __init__(self, binpath, datadir):
+    def __init__(self, binpath, datadir, npred=320):
         blob = open(os.path.join(datadir, "blob_path.txt")).read().strip()
-        self.p = subprocess.Popen([binpath, datadir, blob, "--serve", "320"],
+        self.npred = npred
+        self.p = subprocess.Popen([binpath, datadir, blob, "--serve", str(npred)],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, bufsize=0)
         while True:
@@ -82,7 +83,10 @@ class CpubrrrServe:
                 raise RuntimeError("engine died during warmup")
 
     def ask(self, prompt):
-        self.p.stdin.write((prompt.replace("\n", " ") + "\n").encode())
+        # TSV serve protocol: temp \t seed \t ngen \t prompt (both engines accept it;
+        # qwen is greedy-only and ignores temp/seed)
+        line = f"0\t1\t{self.npred}\t" + prompt.replace("\t", " ").replace("\n", " ") + "\n"
+        self.p.stdin.write(line.encode())
         self.p.stdin.flush()
         out = b""
         fd = self.p.stdout.fileno()
@@ -97,10 +101,10 @@ class CpubrrrServe:
     def close(self):
         self.p.kill()
 
-def ollama_ask(model, prompt):
+def ollama_ask(model, prompt, npred=320):
     body = json.dumps({"model": model, "prompt": prompt, "stream": False,
                        "keep_alive": "30m",
-                       "options": {"temperature": 0, "num_predict": 320}}).encode()
+                       "options": {"temperature": 0, "num_predict": npred}}).encode()
     req = urllib.request.Request("http://localhost:11434/api/generate", data=body,
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=600) as r:
@@ -110,6 +114,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--engine", choices=list(ENGINES), required=True)
     ap.add_argument("--n", type=int, default=100)
+    ap.add_argument("--npred", type=int, default=320,
+                    help="max new tokens BOTH sides; raise for reasoning models so "
+                         "the thinking channel can't eat the budget before the answer")
     ap.add_argument("--skip-ollama", action="store_true")
     args = ap.parse_args()
     cfg = ENGINES[args.engine]
@@ -117,7 +124,7 @@ def main():
     print(f"GSM8K parity, {len(items)} questions, model {cfg['ollama_model']}")
 
     results = {"cpubrrr": [], "ollama": []}
-    eng = CpubrrrServe(cfg["bin"], cfg["data"])
+    eng = CpubrrrServe(cfg["bin"], cfg["data"], args.npred)
     t0 = time.time()
     for i, it in enumerate(items):
         text = eng.ask(it["q"] + PROMPT_SUFFIX)
@@ -130,7 +137,7 @@ def main():
     if not args.skip_ollama:
         t0 = time.time()
         for i, it in enumerate(items):
-            text = ollama_ask(cfg["ollama_model"], it["q"] + PROMPT_SUFFIX)
+            text = ollama_ask(cfg["ollama_model"], it["q"] + PROMPT_SUFFIX, args.npred)
             ok = norm(extract_answer(text)) == norm(it["gold"])
             results["ollama"].append(ok)
             print(f"  ollama  {i+1}/{len(items)} {'ok' if ok else 'WRONG'}", file=sys.stderr)

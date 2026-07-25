@@ -154,9 +154,14 @@ weights*, same prompts, greedy decoding, same answer extraction
 | benchmark | model | cpubrrr | Ollama/llama.cpp | delta |
 |---|---|---|---|---|
 | GSM8K (100 q) | Qwen3-Coder-30B Q4_K | **89.0%** | 87.0% | +2.0 (within noise) |
+| GSM8K (100 q, 1024-tok budget) | gpt-oss:20b MXFP4 | **98.0%** | 94.0% | +4.0 (edge of noise) |
 
-Deltas within ±3 points at n=100 are sampling noise; the claim is *parity*, not
-superiority. The speed does not come from corrupted math.
+Deltas of a few points at n=100 are sampling noise; the claim is *parity*, not
+superiority. The speed does not come from corrupted math. (Methodology note that
+almost fooled us: at a 320-token budget the gpt-oss comparison showed a fake +47 —
+the model's *thinking channel* ate the budget before the final answer on one side.
+Reasoning models need budgets big enough that nobody truncates. Caught, fixed,
+logged.)
 
 ## Benchmark integrity (read this before quoting numbers)
 
