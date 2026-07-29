@@ -4,22 +4,29 @@
 https://github.com/user-attachments/assets/a390cb6e-86b8-41e5-9ef6-957c94dabe19
 
 
-**From-scratch CPU-only LLM inference that beats llama.cpp's CPU path — on both quant formats it runs, no GPU.**
+**From-scratch CPU-only LLM inference. Faster than upstream llama.cpp on Q4_K, at parity on MXFP4 — and ~5× Ollama's bundled runner. No GPU.**
 
 `cpubrrr` is a research runtime that runs frontier-class **mixture-of-experts** models
 on an Apple M4 Max **CPU only** — the binary links nothing but the C standard library,
 so it *physically cannot* touch the GPU (`otool -L target/release/engine` to verify). It
 started as a one-model experiment (gpt-oss:20b) and now runs four MoE models across two
-architectures and two quantization formats from one config-driven engine — and it is
-**faster than llama.cpp's CPU path on both formats**, including Q4_K, llama.cpp's own
-hand-tuned home turf.
+architectures and two quantization formats from one config-driven engine. Against
+**upstream llama.cpp** it is ~1.17× faster on Q4_K (llama.cpp's own hand-tuned home
+turf) and at parity on MXFP4; against Ollama's bundled runner it is ~5× on gpt-oss.
 
 ## Numbers (Apple M4 Max, CPU only, log-verified 0 GPU layers, cool + quiet machine)
 
-| model | quant | cpubrrr | llama.cpp CPU | |
-|---|---|---|---|---|
-| **gpt-oss:20b** | MXFP4 | **~77 tok/s** | ~14 tok/s | **~5×** |
-| **Qwen3-Coder-30B** | Q4_K/Q6_K | **~92 tok/s** | ~82 tok/s | **~1.1–1.2×** |
+| model (CPU decode) | cpubrrr | upstream llama.cpp (b7e1e28c) | Ollama bundled runner |
+|---|---|---|---|
+| **gpt-oss:20b** MXFP4 | **~68–77 tok/s** | ~67 tok/s (parity) | ~14 tok/s (~5×) |
+| **Qwen3-Coder-30B** Q4_K | **~90 tok/s** | ~77 tok/s (**~1.17×**) | ~82 tok/s |
+
+**Correction (2026-07-27, prompted by reddit user Fedor_Doc):** earlier versions of
+this README said "beats llama.cpp ~5×" on gpt-oss. That baseline was **Ollama's
+bundled runner**, not upstream llama.cpp — upstream handles MXFP4 MoE fine, and
+against it we are at parity on gpt-oss. The Q4_K win stands against the strongest
+baseline. Lesson #6 in the research log: benchmark the strongest available baseline,
+and name the exact implementation.
 
 Decode throughput, several runs each. Output verified correct in both cases. llama.cpp
 placement confirmed CPU-only from Ollama's own server logs (it defaults to Metal GPU on

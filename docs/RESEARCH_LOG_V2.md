@@ -648,3 +648,31 @@ S1 DONE: q4k_dot_k (k<=8) in engine_qwen2 — weight bytes loaded once per super
 k sdot streams, k accumulators. Verified BIT-EXACT (max rel 0.00e0) vs k independent
 q4k_dot calls on real blk.0 wq rows (CPBRR_VERIFYK=1). Next: S2 k-wide forward pass,
 S3 prompt-lookup draft + accept loop, S4 honest bench (code AND prose prompts).
+
+---
+
+## 2026-07-27 — "Ollama != llama.cpp": lesson #6, and it corrects our headline
+
+Reddit comment (Fedor_Doc): "Ollama != llama.cpp. What build of llama.cpp have you
+actually tested?" Answer until today: none — every baseline was Ollama's BUNDLED
+runner. Built upstream llama.cpp from source (b7e1e28c, -DGGML_METAL=OFF), ran
+llama-bench -ngl 0 -t 12, quiet machine (91% idle, 86W). Ollama's gpt-oss blob does
+not even load in upstream (ollama ships gpt-oss via its own pipeline) — used the HF
+GGUF (ggml-org/gpt-oss-20b-GGUF, MXFP4, 12.1GB).
+
+| model, CPU decode | cpubrrr (same session) | upstream llama.cpp | Ollama bundled runner |
+|---|---|---|---|
+| gpt-oss:20b MXFP4 | 68.5 (67.8/68.9/68.7) | **66.8 ± 4.6** | ~14 |
+| Qwen3-Coder-30B Q4_K | 90.5 (90.6/90.9/89.9) | **77.5 ± 5.3** | ~82 |
+
+THE CORRECTION: our "5x llama.cpp" gpt-oss claim was really "5x Ollama's bundled
+runner" — upstream llama.cpp handles MXFP4 MoE fine (66.8), and cpubrrr is at PARITY
+with it there, not 5x. The qwen result survives against the strongest baseline:
+90.5 vs 77.5 = ~1.17x. (Session note: cpubrrr gpt-oss read 68.5 here vs 77 in
+earlier sessions — different prompt/battery state; both engines measured in the SAME
+session for this table, which is what makes it fair.)
+
+LESSON #6: benchmark the STRONGEST available baseline, not the most convenient one.
+"Ollama" is not a synonym for "llama.cpp" — its bundled runner can be radically
+slower than upstream (gpt-oss) or faster (qwen). Baselines must name the exact
+implementation and build.
