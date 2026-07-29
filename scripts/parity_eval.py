@@ -31,6 +31,11 @@ ENGINES = {
         "data": os.path.join(ROOT, "data-gpt-oss_20b"),
         "ollama_model": "gpt-oss:20b",
     },
+    "gptoss2": {
+        "bin": os.path.join(ROOT, "target/release/engine_gpt2"),
+        "data": os.path.join(ROOT, "data-gpt-oss_20b"),
+        "ollama_model": "gpt-oss:20b",
+    },
 }
 
 PROMPT_SUFFIX = "\n\nSolve step by step, then give the final numeric answer on the last line as: #### <number>"

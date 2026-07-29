@@ -702,3 +702,54 @@ Plan (mirror the qwen2 rewrite, new bin src/bin/engine_gpt2.rs):
 Watch for: mixed tensor types per layer (lesson from metal engine), the 13-hot-threads
 preemption trap (main must park or work, never spin as a 13th), stage-profile reset
 after prefill for honest decode profiling.
+
+---
+
+## 2026-07-29 — A-phase DONE: engine_gpt2, worker-driven gpt-oss
+
+Port landed: `src/bin/engine_gpt2.rs` — engine_qwen2's worker/barrier skeleton
+(12 persistent workers, sense-reversing yielding barriers, park once per token)
+carrying engine.rs's gpt-oss math verbatim (YaRN RoPE, attention sinks in the
+softmax denominator, SWA on even layers, Q8 attention + biases, quad-interleaved
+MXFP4 experts, clamped SwiGLU-OAI, harmony template, TSV serve protocol,
+temp/seed sampling).
+
+Verification gates:
+1. DUMP layer sums vs engine.rs: bit-match (|x| identical to 4 decimals, p0-p2,
+   all 24 layers) once rmsnorm summed in engine.rs's serial fp order.
+2. Greedy output: bit-identical over 96 tokens (held through rope table, stage
+   fusions, u8-exp scales; relaxed by the final dot_q8_i8 2-acc unroll, which
+   reorders fp sums — quality re-verified by gate 3).
+3. GSM8K parity (n=100, npred=1024, same session): engine_gpt2 98/100,
+   engine.rs 98/100. (First run at the default 320 budget read 90/100 — lesson
+   #5's truncation artifact, rediscovered on schedule.)
+4. Same-session decode bench (desktop-loaded machine, 5 alternating rounds):
+   engine_gpt2 82.8 median / 87.3 best vs engine.rs 74.4 median / 76.7 best
+   (+11% median). Quiet-machine best seen: 88.9. Upstream llama-bench rerun
+   still owed — the HF GGUF (ggml-org/gpt-oss-20b-GGUF, 12.1 GB) is no longer
+   on disk; prior upstream number: 66.8 ± 4.6.
+
+What moved the needle (77.4 -> ~87-89):
+- rmsnorm: redundant full serial sum per worker (deterministic AND one less
+  barrier; partial-sum reduction had flipped near-tie argmaxes).
+- RoPE cos/sin table (kills ~55k powf/token). TRAP: building the table from the
+  same *source formula* diverged from the inline path (compiler emitted a
+  different powf lowering per context) and silently broke greedy parity —
+  fixed by generating the table THROUGH the compiled inline rotation applied to
+  (1,0) basis vectors. Lesson: derive lookup tables from the code path they
+  replace, not from the math that code was written from.
+- Fused ao-quant into attention (hd=64 = exactly 2 Q8 blocks per head) and
+  down-proj + weighted residual into one stage; both preserve per-element fp
+  order.
+- Expert scales as raw u8 exponents + 256-entry 2^(e-128) table: f32 scales
+  were 20% of the expert stream (~300 MB/token at 24 layers).
+- dot_q8_i8 2-block unroll, 2 independent fp accumulators (fma-latency-bound,
+  not BW-bound): +2 tok/s. 4-acc was not better.
+- E-core recruitment (4 extra workers, weighted slices, UTILITY QoS): WORSE
+  (85 -> 67 at NT=16) — E-core barrier stragglers eat the extra bandwidth.
+  CPBRR_NT stays default 12.
+
+Aggregate streams ~2.5 GB/token (attn 0.64 + gate/up 0.85 + down 0.42 + head
+0.58) -> ~205 GB/s sustained at 83 tok/s vs bench_moe's 294 GB/s ceiling; the
+head (580 MB Q8, ~260 GB/s) is already at roofline. Remaining gap lives in the
+attention and expert stages.
