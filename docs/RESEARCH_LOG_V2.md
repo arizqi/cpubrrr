@@ -676,3 +676,29 @@ LESSON #6: benchmark the STRONGEST available baseline, not the most convenient o
 "Ollama" is not a synonym for "llama.cpp" — its bundled runner can be radically
 slower than upstream (gpt-oss) or faster (qwen). Baselines must name the exact
 implementation and build.
+
+---
+
+## NEXT: A-phase — port worker-driven architecture to the gpt-oss engine
+
+Target: gpt-oss decode 68.5 -> ~90 (beat upstream llama.cpp's 66.8 decisively).
+Evidence it works: engine_qwen2 (worker-driven) hits 90.5 at similar traffic while
+engine.rs (fork-join pool + serial glue) sits at 68.5; bench_moe shows the machine
+sustains 294 GB/s vs the engine's ~210 on expert stages.
+
+Plan (mirror the qwen2 rewrite, new bin src/bin/engine_gpt2.rs):
+1. Copy engine_qwen2's skeleton: 12 persistent workers, sense-reversing YIELDING
+   barriers (spin 1023 then yield_now), workers park once per token, main thread
+   condvar-signals per token. NT=12, QoS 0x21.
+2. Forward pass per worker with sl() slicing: embed, rmsnorm_par, Q8 quant (Q8 per-32
+   as engine.rs uses), qkv (Q8 mats), rope+sinks+SWA per-layer (COPY the exact math
+   from engine.rs: attention sinks in softmax denominator, sliding window per layer),
+   MXFP4 quad-interleaved gate/up (dot4_mx_i8) + clamped SwiGLU-OAI act, down, head.
+   Reuse engine.rs kernels verbatim (repack_mx, dot4_mx_i8, dot_q8_i8).
+3. Keep harmony template + TSV serve protocol + sampling (temp/seed) from engine.rs.
+4. Verify: CPBRR_DBG stage sums vs engine.rs (bit-match through L1 like the metal
+   debug), then greedy output identical on standard prompts, then parity_eval GSM8K.
+5. Bench same-session vs upstream llama-bench (lesson #6 discipline).
+Watch for: mixed tensor types per layer (lesson from metal engine), the 13-hot-threads
+preemption trap (main must park or work, never spin as a 13th), stage-profile reset
+after prefill for honest decode profiling.
