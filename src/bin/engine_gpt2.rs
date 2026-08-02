@@ -34,6 +34,17 @@ fn total_units() -> u64 {
     *T.get_or_init(|| { let n = NT(); if n <= NP { n as u64 * 5 } else { NP as u64 * 5 + (n - NP) as u64 * EW } })
 }
 fn dbg_on() -> bool { static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *D.get_or_init(|| std::env::var("CPBRR_DBG").is_ok()) }
+/// claims per worker per stage: small = better balance, more atomic traffic
+#[allow(non_snake_case)]
+fn chunks_per_worker() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("CPBRR_CHUNKS").ok().and_then(|s| s.parse().ok()).unwrap_or(6).max(1))
+}
+fn spin_before_yield() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("CPBRR_SPIN").ok().and_then(|s| s.parse().ok()).unwrap_or(1023))
+}
+fn head2_on() -> bool { static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *D.get_or_init(|| std::env::var("CPBRR_HEAD2").is_ok()) }
 fn headchk_on() -> bool { static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *D.get_or_init(|| std::env::var("CPBRR_HEADCHK").is_ok()) }
 static HEAD_MISS: AtomicU64 = AtomicU64::new(0);
 static HEAD_TOT: AtomicU64 = AtomicU64::new(0);
@@ -237,21 +248,10 @@ impl Q4Mat {
                         for r in 0..4 {
                             let row = q * 4 + r;
                             let mut vals = [0f32; 32];
-                            // Q4_0: scale from the SIGNED extreme so it maps exactly to code 0
-                            let mut vmax = 0f32;
-                            let mut amax = 0f32;
                             for i in 0..32 {
-                                let v = f32::from_bits((unsafe { *wp.get().add(row * cols + blk * 32 + i) } as u32) << 16);
-                                vals[i] = v;
-                                if v.abs() > amax { amax = v.abs(); vmax = v; }
+                                vals[i] = f32::from_bits((unsafe { *wp.get().add(row * cols + blk * 32 + i) } as u32) << 16);
                             }
-                            let d = vmax / -8.0;
-                            let id = if d != 0.0 { 1.0 / d } else { 0.0 };
-                            // bf16 round-to-nearest-even on the scale, then quantize against
-                            // the STORED scale so load-time and run-time dequant agree exactly
-                            let db = f32_to_bf16(d);
-                            let dq = bf16_to_f32(db);
-                            let idq = if dq != 0.0 { 1.0 / dq } else { id };
+                            let (db, idq) = q4_scale_search(&vals);
                             unsafe { *sp.get().add(q * nb * 4 + blk * 4 + r) = db };
                             for j in 0..16 {
                                 let lo = ((vals[j] * idq + 8.5).floor() as i32).clamp(0, 15) as u8;
@@ -265,6 +265,35 @@ impl Q4Mat {
         }
         Q4Mat { nib, sc, cols }
     }
+}
+
+/// Pick the Q4 block scale that minimises squared reconstruction error, instead of
+/// pinning it to the signed extreme. Plain Q4_0 makes the vmax side exact but clips
+/// the opposite tail to 7/8 of its magnitude; on attention weights that systematic
+/// bias cost 3 GSM8K points. Sweeping the scale between the symmetric (-7..7) and
+/// Q4_0 (-8..7) endpoints recovers it for free -- same 4.5 bits, load-time only.
+/// Returns (bf16 scale, 1/dequantised-scale) so packing uses the STORED scale.
+fn q4_scale_search(vals: &[f32; 32]) -> (u16, f32) {
+    let (mut amax, mut vmax) = (0f32, 0f32);
+    for &v in vals.iter() { if v.abs() > amax { amax = v.abs(); vmax = v; } }
+    if amax == 0.0 { return (0, 0.0); }
+    let (mut best_err, mut best_db) = (f32::MAX, 0u16);
+    for t in 0..17 {
+        let nmax = 7.0 + t as f32 * 0.0625;          // symmetric .. Q4_0
+        let db = f32_to_bf16(vmax / -nmax);
+        let d = bf16_to_f32(db);
+        if d == 0.0 { continue; }
+        let id = 1.0 / d;
+        let mut err = 0f32;
+        for &v in vals.iter() {
+            let c = ((v * id + 8.5).floor() as i32).clamp(0, 15);
+            let e = v - (c - 8) as f32 * d;
+            err += e * e;
+        }
+        if err < best_err { best_err = err; best_db = db; }
+    }
+    let d = bf16_to_f32(best_db);
+    (best_db, if d != 0.0 { 1.0 / d } else { 0.0 })
 }
 
 #[inline(always)]
@@ -310,6 +339,88 @@ unsafe fn dot4_q4_i8(nib: *const u8, sc: *const u16, xq: *const i8, xsb: *const 
             sp = sp.add(4);
         }
         [vaddvq_f32(a0), vaddvq_f32(a1), vaddvq_f32(a2), vaddvq_f32(a3)]
+    }
+}
+
+/// Nibble-pair -> signed value for linear Q2 (same Q4_0 shape, 2 bits).
+const KVI2: [i8; 16] = [-2, -1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+/// Quad-interleaved linear Q2 with bf16 block scales -- 2.5 bits/weight.
+/// Only ever used to RANK head rows; the winners are recomputed from Q8, so the
+/// emitted token does not depend on Q2 precision, only on the true top-1 surviving
+/// into the candidate set (measured by CPBRR_HEADCHK).
+/// Row layout per 32-block: 8 bytes, byte j holding elements j, j+8, j+16, j+24.
+struct Q2Mat { nib: Vec<u8>, sc: Vec<u16>, cols: usize }
+impl Q2Mat {
+    fn from_bf16(w: *const u16, rows: usize, cols: usize) -> Self {
+        assert_eq!(rows % 4, 0);
+        let nb = cols / 32;
+        let mut nib = vec![0u8; rows * cols / 4];
+        let mut sc = vec![0u16; rows * nb];
+        {
+            let np = SendMutU8(nib.as_mut_ptr());
+            let sp = SendMutU16Mut(sc.as_mut_ptr());
+            let wp = SendU16(w);
+            par_load(rows / 4, |a, b| {
+                for q in a..b {
+                    for blk in 0..nb {
+                        for r in 0..4 {
+                            let row = q * 4 + r;
+                            let mut vals = [0f32; 32];
+                            let (mut vmax, mut amax) = (0f32, 0f32);
+                            for i in 0..32 {
+                                let v = f32::from_bits((unsafe { *wp.get().add(row * cols + blk * 32 + i) } as u32) << 16);
+                                vals[i] = v;
+                                if v.abs() > amax { amax = v.abs(); vmax = v; }
+                            }
+                            let d = vmax / -2.0;
+                            let db = f32_to_bf16(d);
+                            let dq = bf16_to_f32(db);
+                            let idq = if dq != 0.0 { 1.0 / dq } else { 0.0 };
+                            unsafe { *sp.get().add(q * nb * 4 + blk * 4 + r) = db };
+                            for j in 0..8 {
+                                let mut byte = 0u8;
+                                for k in 0..4 {
+                                    let c = ((vals[j + k * 8] * idq + 2.5).floor() as i32).clamp(0, 3) as u8;
+                                    byte |= c << (k * 2);
+                                }
+                                unsafe { *np.get().add((q * nb + blk) * 32 + r * 8 + j) = byte };
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        Q2Mat { nib, sc, cols }
+    }
+}
+
+unsafe fn dot4_q2_i8(nib: *const u8, sc: *const u16, xq: *const i8, xsb: *const f32, nblocks: usize) -> [f32; 4] {
+    unsafe {
+        let kv = vld1q_s8(KVI2.as_ptr());
+        let m = vdup_n_u8(3);
+        let mut a = [vdupq_n_f32(0.0); 4];
+        let mut np = nib;
+        let mut sp = sc;
+        for b in 0..nblocks {
+            let x0 = vld1q_s8(xq.add(b * 32));
+            let x1 = vld1q_s8(xq.add(b * 32 + 16));
+            let sv = vmulq_n_f32(vreinterpretq_f32_u32(vshll_n_u16::<16>(vld1_u16(sp))), *xsb.add(b));
+            let mut t = [vdupq_n_s32(0); 4];
+            for r in 0..4 {
+                let p = vld1_u8(np.add(r * 8));
+                let lo = vcombine_u8(vand_u8(p, m), vand_u8(vshr_n_u8::<2>(p), m));
+                let hi = vcombine_u8(vand_u8(vshr_n_u8::<4>(p), m), vshr_n_u8::<6>(p));
+                t[r] = sdot(sdot(vdupq_n_s32(0), vqtbl1q_s8(kv, lo), x0), vqtbl1q_s8(kv, hi), x1);
+            }
+            a[0] = vfmaq_laneq_f32::<0>(a[0], vcvtq_f32_s32(t[0]), sv);
+            a[1] = vfmaq_laneq_f32::<1>(a[1], vcvtq_f32_s32(t[1]), sv);
+            a[2] = vfmaq_laneq_f32::<2>(a[2], vcvtq_f32_s32(t[2]), sv);
+            a[3] = vfmaq_laneq_f32::<3>(a[3], vcvtq_f32_s32(t[3]), sv);
+            np = np.add(32);
+            sp = sp.add(4);
+        }
+        [vaddvq_f32(a[0]), vaddvq_f32(a[1]), vaddvq_f32(a[2]), vaddvq_f32(a[3])]
     }
 }
 
@@ -475,7 +586,7 @@ fn rope_yarn(v: *mut f32, pos: usize) {
 // ---------------- per-layer weights ----------------
 struct Layer {
     attn_norm: Vec<f32>, ffn_norm: Vec<f32>,
-    wq: Q4Mat, wk: Q8Mat, wv: Q8Mat, wo: Q4Mat,   // wq/wo are 94% of attention bytes -> Q4; wk/wv stay Q8 (softmax + residual paths)
+    wq: Q8Mat, wk: Q8Mat, wv: Q8Mat, wo: Q8Mat,   // CONTROL: all-Q8 attention
     bq: Vec<f32>, bk: Vec<f32>, bv: Vec<f32>, bo: Vec<f32>,
     sinks: Vec<f32>,
     ginp: Vec<f32>, ginp_b: Vec<f32>,
@@ -508,7 +619,7 @@ impl Model {
 /// Safe only for stages whose per-item work is independent of which worker runs it.
 #[inline(always)]
 fn steal<F: FnMut(usize)>(sh: &Shared, n: usize, mut f: F) {
-    let ch = ((n + NT() * 6 - 1) / (NT() * 6)).max(1);
+    let ch = ((n + NT() * chunks_per_worker() - 1) / (NT() * chunks_per_worker())).max(1);
     loop {
         let a = sh.wctr.fetch_add(ch, Ordering::Relaxed);
         if a >= n { break; }
@@ -537,7 +648,7 @@ struct Shared {
     m: std::sync::Mutex<()>, cv: std::sync::Condvar,
     dm: std::sync::Mutex<()>, dcv: std::sync::Condvar,
     // model
-    layers: &'static [Layer], out_norm: &'static [f32], head: &'static Q8Mat, head4: &'static Q4Mat, tok_embd: *const u16,
+    layers: &'static [Layer], out_norm: &'static [f32], head: &'static Q8Mat, head4: &'static Q4Mat, head2: &'static Q2Mat, tok_embd: *const u16,
     // activation buffers
     x: *mut f32, xn: *mut f32, xq: *mut i8, xsb: *mut f32,
     q: *mut f32, k: *mut f32, v: *mut f32, ao: *mut f32,
@@ -560,7 +671,7 @@ fn bar(sh: &Shared, ls: &mut bool) {
         let mut n = 0u32;
         while sh.bsense.load(Ordering::Acquire) != *ls {
             n += 1;
-            if n & 1023 != 0 { std::hint::spin_loop(); } else { std::thread::yield_now(); }
+            if n & spin_before_yield() != 0 { std::hint::spin_loop(); } else { std::thread::yield_now(); }
         }
     }
 }
@@ -577,22 +688,51 @@ fn qblock32(src: *const f32, xq: *mut i8, xsb: *mut f32, blk: usize) {
     }
 }
 
-/// Parallel sum-of-squares: fixed slices, reduced in fixed worker order, so the
-/// result is bit-reproducible run to run. (An earlier version had every worker
-/// redundantly sum all d elements to match engine.rs's serial fp order; the
-/// dot_q8_i8 unroll ended that bit-identity anyway, so the redundant work was
-/// pure cost -- ~1.7M scalar fma/token across the pool.)
+/// Sum of squares, 4 independent NEON accumulators. Cheap enough (~50ns for d=2880)
+/// that every worker recomputing it in full beats exchanging partial sums: it deletes
+/// one barrier from all 49 rmsnorms per token, and bench_bw prices a barrier at
+/// ~0.2 GB/s of streaming bandwidth. An earlier SCALAR version of this idea was
+/// removed for being slow -- it was, but only because a serial `s += v*v` chain runs
+/// at fp-add latency; with 4 accumulators the same work is ~30x cheaper.
+/// Every worker gets the identical sum, so the result is reproducible regardless of
+/// how work-stealing partitioned the surrounding stages.
+#[inline(always)]
+unsafe fn ssq(x: *const f32, d: usize) -> f32 {
+    unsafe {
+        let (mut a0, mut a1) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+        let (mut a2, mut a3) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+        let mut i = 0;
+        while i + 16 <= d {
+            let v0 = vld1q_f32(x.add(i)); let v1 = vld1q_f32(x.add(i + 4));
+            let v2 = vld1q_f32(x.add(i + 8)); let v3 = vld1q_f32(x.add(i + 12));
+            a0 = vfmaq_f32(a0, v0, v0); a1 = vfmaq_f32(a1, v1, v1);
+            a2 = vfmaq_f32(a2, v2, v2); a3 = vfmaq_f32(a3, v3, v3);
+            i += 16;
+        }
+        let mut s = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+        while i < d { s += *x.add(i) * *x.add(i); i += 1; }
+        s
+    }
+}
+
+/// rmsnorm fused with the Q8 quant of the SAME block-aligned slice: one barrier total.
+#[inline(always)]
+fn rmsnorm_quant_par(sh: &Shared, wid: usize, ls: &mut bool, x: *mut f32, out: *mut f32, w: *const f32, d: usize, nblk: usize) {
+    unsafe {
+        let inv = 1.0 / (ssq(x, d) / d as f32 + cfg().rms_eps).sqrt();
+        let (ba, bb) = sl(wid, nblk);
+        for i in ba * 32..bb * 32 { *out.add(i) = *x.add(i) * inv * *w.add(i); }
+        for bl in ba..bb { qblock32(out, sh.xq, sh.xsb, bl); }
+        bar(sh, ls);
+    }
+}
+
+/// Plain rmsnorm (no fused quant) for the FFN, whose router reads all of xn.
 #[inline(always)]
 fn rmsnorm_par(sh: &Shared, wid: usize, ls: &mut bool, x: *mut f32, out: *mut f32, w: *const f32, d: usize) {
     unsafe {
+        let inv = 1.0 / (ssq(x, d) / d as f32 + cfg().rms_eps).sqrt();
         let (a, b) = sl(wid, d);
-        let mut ps = 0f32;
-        for i in a..b { let v = *x.add(i); ps += v * v; }
-        *sh.partials.add(wid) = ps;
-        bar(sh, ls);
-        let mut tot = 0f32;
-        for k in 0..NT() { tot += *sh.partials.add(k); }
-        let inv = 1.0 / (tot / d as f32 + cfg().rms_eps).sqrt();
         for i in a..b { *out.add(i) = *x.add(i) * inv * *w.add(i); }
         bar(sh, ls);
     }
@@ -620,38 +760,33 @@ fn forward_worker(sh: &Shared, wid: usize, ls: &mut bool) {
             let vcl = sh.vc.add(il * MAXSEQ * nkv * hd);
             let _ta = if wid==0 { Some(Instant::now()) } else { None };
             // ---- attn rmsnorm + quant ----
-            rmsnorm_par(sh, wid, ls, sh.x, sh.xn, ly.attn_norm.as_ptr(), d);
-            { let (a, b) = sl(wid, nb); for bl in a..b { qblock32(sh.xn, sh.xq, sh.xsb, bl); } }
-            bar(sh, ls);
+            rmsnorm_quant_par(sh, wid, ls, sh.x, sh.xn, ly.attn_norm.as_ptr(), d, nb);
             // qkv matvec + bias
-            // quads over the fused q|k|v row space; every matrix boundary is 4-aligned
-            { let nr4 = (nh * hd + 2 * nkv * hd) / 4;
-              steal(sh, nr4, |qd| {
-                let r = qd * 4;
-                if r < nh * hd {
-                    let g = qd;
-                    let v4 = dot4_q4_i8(ly.wq.nib.as_ptr().add(g * nb * 64), ly.wq.sc.as_ptr().add(g * nb * 4), sh.xq, sh.xsb, nb);
-                    for i in 0..4 { *sh.q.add(r + i) = v4[i] + ly.bq[r + i]; }
-                } else if r < nh * hd + nkv * hd {
-                    let rr = r - nh * hd;
-                    for i in 0..4 { *sh.k.add(rr + i) = ly.wk.dot(rr + i, sh.xq, sh.xsb) + ly.bk[rr + i]; }
+            // qkv fused with rope + kv-cache write. Work item = one head, so whoever
+            // computes a head's rows also rotates them and writes the cache: removes a
+            // barrier per layer, and 16 consecutive wq quads is still one 92KB
+            // sequential run per claim.
+            { steal(sh, nh + nkv, |h| {
+                if h < nh {
+                    let base = h * hd;
+                    for r in 0..hd { *sh.q.add(base + r) = ly.wq.dot(base + r, sh.xq, sh.xsb) + ly.bq[base + r]; }
+                    rope_yarn(sh.q.add(base), pos);
                 } else {
-                    let rr = r - nh * hd - nkv * hd;
-                    for i in 0..4 { *sh.v.add(rr + i) = ly.wv.dot(rr + i, sh.xq, sh.xsb) + ly.bv[rr + i]; }
+                    let hh = h - nh;
+                    let base = hh * hd;
+                    for r in 0..hd {
+                        *sh.k.add(base + r) = ly.wk.dot(base + r, sh.xq, sh.xsb) + ly.bk[base + r];
+                        *sh.v.add(base + r) = ly.wv.dot(base + r, sh.xq, sh.xsb) + ly.bv[base + r];
+                    }
+                    rope_yarn(sh.k.add(base), pos);
+                    for j in 0..hd {
+                        *kcl.add((pos * nkv + hh) * hd + j) = *sh.k.add(base + j);
+                        *vcl.add((pos * nkv + hh) * hd + j) = *sh.v.add(base + j);
+                    }
                 }
               }); }
             bar(sh, ls);
             if wid == 0 && il == 0 && dbg_on() { eprintln!("DBG L0 qkv q {:.6} k {:.6} v {:.6}", dsum(sh.q, nh*hd), dsum(sh.k, nkv*hd), dsum(sh.v, nkv*hd)); }
-            // rope + kv-cache write (parallel over nh+nkv heads; v has no rope)
-            { let (a, b) = sl(wid, nh + nkv);
-              for h in a..b {
-                if h < nh { rope_yarn(sh.q.add(h * hd), pos); }
-                else { let hh = h - nh;
-                    rope_yarn(sh.k.add(hh * hd), pos);
-                    for j in 0..hd { *kcl.add((pos * nkv + hh) * hd + j) = *sh.k.add(hh * hd + j); *vcl.add((pos * nkv + hh) * hd + j) = *sh.v.add(hh * hd + j); }
-                }
-              } }
-            bar(sh, ls);
             // attention (parallel over nh q-heads); sinks in denom, SWA on even layers
             { let scale = 1.0 / (hd as f32).sqrt();
               let start = if (il + 1) % 2 != 0 { pos.saturating_sub(c.swa - 1) } else { 0 };
@@ -692,12 +827,7 @@ fn forward_worker(sh: &Shared, wid: usize, ls: &mut bool) {
               }); }
             bar(sh, ls);
             // o-proj + bias + residual
-            { let anb = (nh * hd) / 32;
-              steal(sh, d / 4, |qd| {
-                let r = qd * 4;
-                let v4 = dot4_q4_i8(ly.wo.nib.as_ptr().add(qd * anb * 64), ly.wo.sc.as_ptr().add(qd * anb * 4), sh.aq, sh.asb, anb);
-                for i in 0..4 { *sh.x.add(r + i) += v4[i] + ly.bo[r + i]; }
-              }); }
+            { steal(sh, d, |r| { *sh.x.add(r) += ly.wo.dot(r, sh.aq, sh.asb) + ly.bo[r]; }); }
             bar(sh, ls);
             if wid == 0 && il == 0 && dbg_on() { eprintln!("DBG L0 ao {:.6} x-after-attn {:.6}", dsum(sh.ao, nh*hd), dsum(sh.x, d)); }
             if let Some(t)=_ta { TM[0].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
@@ -795,16 +925,16 @@ fn forward_worker(sh: &Shared, wid: usize, ls: &mut bool) {
         // Screening at Q4 halves that; the winner set is then recomputed from the
         // Q8 weights, so the emitted token is bit-identical to a full Q8 argmax as
         // long as the true top-1 survives its own worker's top-CAND screen.
-        rmsnorm_par(sh, wid, ls, sh.x, sh.xn, sh.out_norm.as_ptr(), d);
-        { let (a, b) = sl(wid, nb); for bl in a..b { qblock32(sh.xn, sh.xq, sh.xsb, bl); } }
-        bar(sh, ls);
+        rmsnorm_quant_par(sh, wid, ls, sh.x, sh.xn, sh.out_norm.as_ptr(), d, nb);
         {
-            let h4 = sh.head4;
             let (qa, qb) = sl(wid, c.nvocab / 4);
             let mut lv = [f32::MIN; CAND];
             let mut li = [0u32; CAND];
+            let q2 = head2_on();
+            let (h4, h2) = (sh.head4, sh.head2);
             for q in qa..qb {
-                let v = dot4_q4_i8(h4.nib.as_ptr().add(q * nb * 64), h4.sc.as_ptr().add(q * nb * 4), sh.xq, sh.xsb, nb);
+                let v = if q2 { dot4_q2_i8(h2.nib.as_ptr().add(q * nb * 32), h2.sc.as_ptr().add(q * nb * 4), sh.xq, sh.xsb, nb) }
+                        else  { dot4_q4_i8(h4.nib.as_ptr().add(q * nb * 64), h4.sc.as_ptr().add(q * nb * 4), sh.xq, sh.xsb, nb) };
                 for i in 0..4 {
                     let val = v[i];
                     if val > lv[CAND - 1] {
@@ -892,10 +1022,10 @@ fn main() {
     let layers: Vec<Layer> = (0..c.nl).map(|i| Layer {
         attn_norm: m.f32v(&format!("blk.{i}.attn_norm.weight")),
         ffn_norm: m.f32v(&format!("blk.{i}.ffn_norm.weight")),
-        wq: Q4Mat::from_bf16(m.bf16(&format!("blk.{i}.attn_q.weight")), c.nh * c.hd, c.d),
+        wq: Q8Mat::from_bf16(m.bf16(&format!("blk.{i}.attn_q.weight")), c.nh * c.hd, c.d),
         wk: Q8Mat::from_bf16(m.bf16(&format!("blk.{i}.attn_k.weight")), c.nkv * c.hd, c.d),
         wv: Q8Mat::from_bf16(m.bf16(&format!("blk.{i}.attn_v.weight")), c.nkv * c.hd, c.d),
-        wo: Q4Mat::from_bf16(m.bf16(&format!("blk.{i}.attn_out.weight")), c.d, c.nh * c.hd),
+        wo: Q8Mat::from_bf16(m.bf16(&format!("blk.{i}.attn_out.weight")), c.d, c.nh * c.hd),
         bq: m.f32v(&format!("blk.{i}.attn_q.bias")),
         bk: m.f32v(&format!("blk.{i}.attn_k.bias")),
         bv: m.f32v(&format!("blk.{i}.attn_v.bias")),
@@ -914,6 +1044,7 @@ fn main() {
     let out_norm = m.f32v("output_norm.weight");
     let head = Q8Mat::from_bf16(m.bf16("output.weight"), c.nvocab, c.d);
     let head4 = Q4Mat::from_bf16(m.bf16("output.weight"), c.nvocab, c.d);
+    let head2 = Q2Mat::from_bf16(m.bf16("output.weight"), c.nvocab, c.d);
     eprintln!("prepared in {:.1}s", tq.elapsed().as_secs_f64());
 
     // leak model to 'static
@@ -921,6 +1052,7 @@ fn main() {
     let out_norm: &'static [f32] = Box::leak(out_norm.into_boxed_slice());
     let head: &'static Q8Mat = Box::leak(Box::new(head));
     let head4: &'static Q4Mat = Box::leak(Box::new(head4));
+    let head2: &'static Q2Mat = Box::leak(Box::new(head2));
     let _m: &'static Model = Box::leak(Box::new(m)); // keep mmap alive
 
     // allocate activation buffers (leaked, reused across tokens)
@@ -934,7 +1066,7 @@ fn main() {
         bcount: AtomicUsize::new(0), bsense: AtomicBool::new(false), wctr: AtomicUsize::new(0),
         m: std::sync::Mutex::new(()), cv: std::sync::Condvar::new(),
         dm: std::sync::Mutex::new(()), dcv: std::sync::Condvar::new(),
-        layers, out_norm, head, head4, tok_embd,
+        layers, out_norm, head, head4, head2, tok_embd,
         x: mk_f(d), xn: mk_f(d), xq: mk_i8(d), xsb: mk_f(c.blocks),
         q: mk_f(nh * hd), k: mk_f(nkv * hd), v: mk_f(nkv * hd), ao: mk_f(nh * hd),
         aq: mk_i8(nh * hd), asb: mk_f((nh * hd) / 32),

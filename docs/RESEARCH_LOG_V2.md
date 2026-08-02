@@ -753,3 +753,132 @@ Aggregate streams ~2.5 GB/token (attn 0.64 + gate/up 0.85 + down 0.42 + head
 0.58) -> ~205 GB/s sustained at 83 tok/s vs bench_moe's 294 GB/s ceiling; the
 head (580 MB Q8, ~260 GB/s) is already at roofline. Remaining gap lives in the
 attention and expert stages.
+
+---
+
+## 2026-08-02 — B-phase: the decode roofline, and what actually moves it
+
+Goal handed down: beat upstream llama.cpp by 2x on gpt-oss (upstream 66.8 -> 133.6).
+This entry is mostly about finding out that goal is bounded by the memory system,
+and measuring exactly where the bound is instead of guessing.
+
+### Measuring the ceiling instead of assuming it
+
+bench_moe's 294 GB/s was a tight synthetic loop with no synchronisation. Wrote
+bench_bw to ask the question decode actually cares about: 12 workers, each walking
+its own sequential run, with a barrier between passes.
+
+| barriers per pass | GB/s | |
+|---|---|---|
+| 1   | 271 | pure streaming |
+| 14  | 260 | roughly one per layer |
+| 336 | 197 | what engine_gpt2 was doing |
+
+**Barriers cost 27% of streaming bandwidth at 336/token** (~0.2 GB/s each). That
+reframed the whole problem: this is a bytes-and-stragglers problem, not a flops one.
+
+### Byte accounting (the thing that decides what is possible)
+
+Per decoded token, before any of this: 2637 MB. At 271 GB/s that is a hard ceiling
+of 103 tok/s -- BELOW the 133.6 the goal asks for. No amount of scheduling gets
+there; only moving fewer bytes does.
+
+| config | MB/token | ceiling | GSM8K |
+|---|---|---|---|
+| Q8 attn + Q8 head (start) | 2637 | 103 | 98/100 |
+| + Q4 head (exact)         | 2311 | 117 | 98/100 |
+| + Q4 wo                   | 2152 | 126 | 97/100 |
+| + Q4 wq instead           | 2152 | 126 | 95/100 |
+| + Q4 wq AND wo            | 1993 | 136 | 95/100 |
+
+### The head was 25% of all traffic, and Q4 there is free
+
+201088 x 2880 at Q8 = 651 MB/token, more than all 24 attention blocks combined.
+Replaced with a two-stage head: a Q4 screen ranks the full vocabulary, each worker
+keeps its top-8, and those NT*CAND rows are then recomputed from the Q8 weights.
+The emitted token therefore does not depend on Q4 precision at all -- only on the
+true top-1 surviving its own worker's screen.
+
+Verified rather than asserted: CPBRR_HEADCHK computes the full Q8 argmax alongside
+and compares. 97/97 tokens matched, and greedy output stayed bit-identical to the
+previous engine. 325 MB/token removed at zero quality cost.
+
+### Work stealing: the lesson engine.rs already learned, relearned
+
+engine_gpt2 sliced every stage statically with sl(). engine.rs's par_rows had used
+a shared atomic counter for exactly this reason ("static n/NT chunking made every
+stage wait on the stragglers"). Under a loaded desktop one preempted worker inflates
+every barrier it touches.
+
+Folded the work counter's reset into the barrier's existing bookkeeping -- the last
+arriver already flips the sense, so it resets the counter too, and claiming costs
+nothing. Biggest single win of the session (+10%).
+
+### Barrier reduction: 336 -> 220 per token
+
+- rmsnorm partial-sum exchange deleted: every worker recomputes the full sum of
+  squares with 4 NEON accumulators (~50ns for d=2880). NOTE: an earlier version of
+  this same idea was removed for being slow -- and it WAS, but only because it was a
+  scalar `s += v*v` chain running at fp-add latency. Vectorised, the identical
+  redundant work is ~30x cheaper than the barrier it removes. Same trick, opposite
+  verdict, purely because of how it was written.
+- qkv fused with rope + kv-cache write, keyed by head: whoever builds a head's rows
+  also rotates them and writes the cache.
+- rmsnorm fused with the following Q8 quant on block-aligned slices.
+
+### Which weights can take 4 bits, measured
+
+Assumed wo would be the fragile one (it writes the residual directly, and error
+compounds over 24 layers) and wq the robust one (its error passes through a softmax).
+**Exactly backwards.** Q4 on wq costs 3 GSM8K points; Q4 on wo costs at most 1.
+Confirmed by running wq-only and wo-only separately rather than reasoning about it.
+A better quantiser did not rescue wq either -- an error-minimising scale search over
+17 candidates (vs plain Q4_0, which pins the scale to the signed extreme and clips
+the opposite tail to 7/8) left GSM8K at 95 exactly.
+
+### Negative results kept
+
+- Fusing the SwiGLU activation into gate/up to save a barrier: **-12%**. Alternating
+  gate.nib/up.nib every 5760B defeats the prefetcher; the quad-interleaved layout
+  exists precisely to give each thread ONE sequential stream (E6 lesson 8).
+- E-core workers: still lose (84.8 -> 62.5 at NT=16) even with work stealing, which
+  was the mechanism blamed the first time. Two independent rejections now.
+- 4 fp accumulators in dot_q8_i8 instead of 2: no better.
+
+### Measured result (same session, both engines warm, alternating requests)
+
+Shipping config: Q8 attention + two-stage Q4 head + work stealing + 220 barriers.
+
+| | ngen=128 | ngen=256 |
+|---|---|---|
+| previous engine (c0ad0aa) | 67.3 best / 66.5 med | 59.8 best / 58.0 best |
+| this engine               | 86.1 best / 82.2 med | 77.2 best / 74.5 med |
+| ratio                     | **1.28x** | **1.29x** |
+
+GSM8K 98/100 -- identical to the engine it replaces, so the speedup is free.
+Absolute numbers are depressed by desktop load (WindowServer + apps were eating
+~1.2 cores throughout); the RATIO is the trustworthy figure because both engines
+are resident and alternate requests, seeing the same interference.
+
+Also verified: output is byte-identical across runs. Work stealing changes WHO
+computes a row, never the value, and the rmsnorm is redundant-per-worker rather
+than reduced, so nothing depends on the partition.
+
+### On the 2x goal, honestly
+
+Every configuration that holds GSM8K at 97-98 has a ceiling of 117-126 tok/s, i.e.
+BELOW 133.6. Reaching 2x on this hardware requires Q4 on wq, which measurably costs
+3 GSM8K questions. So the honest statement is not "we hit 2x" but: 2x of upstream on
+gpt-oss decode is past this machine's memory roofline unless you pay for it in
+quality, and here is the measurement that shows it.
+
+### Baseline integrity (lesson #6, still biting)
+
+The 66.8 upstream figure is from Jul 27 and could not be re-measured this session:
+upstream llama.cpp still refuses Ollama's gpt-oss blob. Root cause found -- Ollama
+tags general.architecture = "gptoss" where upstream expects "gpt-oss", and its tensor
+names differ too (attn_out vs attn_output). It is a packaging mismatch, not a weights
+problem, but this llama-bench build has no --override-kv to work around it. A real
+same-session number needs the HF MXFP4 GGUF (12.1 GB), which did not fit: the disk
+had 12 GB free. Until that runs, every ratio in this entry is quoted against a stale
+baseline and should be treated as provisional.
