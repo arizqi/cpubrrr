@@ -882,3 +882,64 @@ problem, but this llama-bench build has no --override-kv to work around it. A re
 same-session number needs the HF MXFP4 GGUF (12.1 GB), which did not fit: the disk
 had 12 GB free. Until that runs, every ratio in this entry is quoted against a stale
 baseline and should be treated as provisional.
+
+---
+
+## 2026-08-02 (cont) — LESSON #7: a baseline's thread count is part of the baseline
+
+Finally re-measured upstream in the same session (downloaded the HF MXFP4 GGUF,
+12.1 GB, after clearing disk space). Upstream forced genuinely CPU-only with
+`-dev none -ngl 0` -- this homebrew build (b9860, fdb1db877) ships a Metal backend,
+unlike July's `-DGGML_METAL=OFF` source build, and this repo has already been burned
+once by a "CPU" baseline quietly using the GPU.
+
+First run, both at `-t 12` (the setting every previous entry used):
+
+    upstream 53.3   cpubrrr 86.2   -> 1.62x
+
+That number is GARBAGE, and it flattered us. Swept upstream's thread count:
+
+| llama.cpp -t | tg128 tok/s |
+|---|---|
+| 6  | ~66 |
+| **8**  | **78.5** |
+| 10 | 69.6 |
+| 12 | 47.7 |
+| 14 | 19.2 |
+| 16 | 11.4 |
+
+**Upstream at -t 12 runs at 61% of its own best.** M4 Max is 12 P + 4 E; llama.cpp's
+barrier degrades badly once threads land on E-cores or get preempted, so oversubscribing
+craters it. cpubrrr pins to P-cores via QoS and work-steals, so it tolerates 10-12 --
+that robustness is a real advantage, but it is NOT a throughput advantage, and quoting
+it as one is exactly the sin lesson #6 was written about.
+
+Swept our own side too and measured best-vs-best, alternating:
+
+| | best | median |
+|---|---|---|
+| upstream llama.cpp, -t 8 | 76.95 | 75.16 |
+| cpubrrr, NT=10           | 90.1  | 89.6  |
+| ratio                    | **1.17x** | **1.19x** |
+
+(cpubrrr is measured with its 73-token harmony prompt already in context, decoding
+pos 73->201, while llama-bench tg128 decodes pos 0->128. The handicap runs against
+cpubrrr, so 1.17x is if anything conservative.)
+
+LESSON #7: a baseline is not just a binary and a build, it is a CONFIGURATION.
+Thread count is a tuning parameter, and the default is not the optimum. Sweep the
+baseline's knobs before quoting a ratio, or you are measuring the competitor's
+misconfiguration and calling it your speedup.
+
+### What this corrects
+
+Every prior gpt-oss comparison in this log used `-t 12` for upstream. The July
+figure of 66.8 was therefore also a mis-tuned baseline. Against a properly tuned
+upstream (~77 tok/s here), the ORIGINAL engine at 68.5 was not at parity -- it was
+BEHIND. The honest current statement is:
+
+  cpubrrr 90.1 vs upstream llama.cpp 76.95, same session, both CPU-only,
+  both at their own best thread count, GSM8K 98/100 -- about **1.17x**.
+
+Not 5x, not 2x, not 1.6x. 1.17x, and the number moved three times today purely from
+fixing how it was measured.
