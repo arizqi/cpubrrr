@@ -1,8 +1,10 @@
 # Show HN draft (2026-08-02, short version)
 
-Checked the last 10 Show HN posts: most have no body text at all, and the ones that
-do run 90-375 words. Keep it under ~220. No em dashes, no bullet symmetry, no
-"here's the thing" cadence. Sound like the Reddit post.
+Framing (2026-08-02, after the batched-prefill session): the MISSION is the post.
+Tokens/sec of reasoning on hardware people already own. Absolute numbers are the
+claim (90 decode / ~140 prefill / 98 GSM8K), llama.cpp is a reference point not the
+headline, and the measurement-honesty record is the evidence. Under ~230 words, no
+em dashes, sound like the Reddit post.
 
 ---
 
@@ -14,27 +16,15 @@ Show HN: Cpubrrr – a CPU-only LLM inference engine in Rust
 
 **Body:**
 
-i keep thinking that tokens/sec of reasoning won't be evenly distributed. a kid with
-15 tok/s and a kid with several hundred have very different tools to think with.
-open weights were step one. throughput on hardware people already own feels like
-step two. so i built a CPU-only inference engine in rust. the binary links only
-libSystem, it physically can't touch the GPU.
+i keep thinking that tokens/sec of reasoning won't be evenly distributed. a kid with 15 tok/s and a kid with several hundred have very different tools to think with. open weights were step one. step two is throughput on hardware people already own. that's what this project tries to prove: how much reasoning speed is actually in a consumer chip if you treat decode as a memory problem and refuse to pay for speed with quality.
 
-on an M4 Max it decodes gpt-oss-20b at 90 tok/s vs 77 for upstream llama.cpp, same
-session, both CPU-only, both tuned. GSM8K 98/100, same score as ollama serving the
-same weights.
+current state on an M4 Max, CPU only (the binary links nothing but libSystem, it physically can't touch the GPU): gpt-oss-20b decodes at 90 tok/s and prefills at ~140. GSM8K 98/100, the same score those weights get served through ollama, and the output head is provably exact.
 
-the embarrassing part: earlier that day i measured 1.62x. i had llama.cpp at -t 12
-because the machine has 12 P-cores. that's nearly its worst setting (48 tok/s).
-its best was -t 8 (78.5). half my "win" was somebody else's misconfiguration, and
-every number i'd published before was against the mistuned baseline too. the repo's
-research log records each wrong number and its correction, in order. there are seven
-lessons in there now and most of them are about measurement, not kernels.
+for reference, upstream llama.cpp on the same machine, same session, tuned to its own best thread count, decodes at 77. i'm deliberately not leading with that ratio. i've published bad ratios before: my first "5x llama.cpp" was really 5x ollama's slow bundled runner, and this week i caught myself at "1.62x upstream" because i'd left llama.cpp at nearly its worst thread setting. the repo's research log records every wrong number and its correction, in order. the absolute numbers are the claim; the log is the evidence.
 
-i'm not a kernel engineer. i directed claude through the kernel work and my job was
-verification gates and retiring numbers that didn't reproduce.
+i'm not a kernel engineer. i directed claude through the kernel work. my job was verification gates and retiring numbers that didn't reproduce.
 
-apple silicon only for now. prefill still loses to llama.cpp. MIT/Apache-2.0.
+apple silicon only for now. MIT/Apache-2.0.
 
 github.com/arizqi/cpubrrr
 
