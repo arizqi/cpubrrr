@@ -988,3 +988,31 @@ while Accelerate holds 3.4.
 Pattern across the day: five separate published claims (5x, parity, qwen 1.17x,
 prefill-vs-GEMM, SME-beats-Accelerate) and none of them survived re-measurement in
 their original form. The kernels were never the weak layer. The claims were.
+
+---
+
+## 2026-08-02 (cont) — batched prefill in engine_gpt2: 87 -> ~140 tok/s, bit-identical
+
+Ported engine.rs's forward_batch idea into the worker-driven engine. The skeleton is
+unchanged; each stage's work item gains a token dimension with weight row OUTER and
+tile tokens INNER, so a row fetched from DRAM once serves the whole tile against
+L1-resident int8 activations. MoE stages batch expert-major: per tile, an expert's
+subscriber list (token, slot) is built redundantly per worker and each claimed quad
+row serves every subscriber.
+
+The gate that matters: batched prefill is BIT-IDENTICAL to token-by-token prefill
+(md5 of greedy output, short prompt AND a 644-token prompt crossing the SWA window
+with a partial final tile). Same kernels, same per-dot inputs, same fp order; only
+the loop order changed. So GSM8K stays 98/100 by construction, no re-run needed.
+CPBRR_NOBATCH=1 keeps the serial path for future A/Bs.
+
+Tile size: 8 -> 138 tok/s, 16 -> 148, 32 -> regression (16 x 2880 int8 = 46KB sits
+in the 128KB L1d; 32 tiles spill). Shipped TILE=16. Measured on the usual loaded
+desktop: 692-token prompt, prefill 87 (serial) -> 138-148 (batched).
+
+Honest ceiling note: 1.6-1.7x from 16x weight reuse, not 16x, because prefill was
+never purely bandwidth-bound the way decode is -- attention's O(pos) work batches
+poorly and the per-dot compute is unchanged. Next lever if prefill matters more:
+k-wide kernels (dot 8 activation vectors per weight load in registers, the
+q4k_dot_k trick from the spec-decode track), which cuts the dot COUNT, not just the
+DRAM traffic.

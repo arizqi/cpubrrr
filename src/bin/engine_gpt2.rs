@@ -14,6 +14,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::time::Instant;
 
 const MAXSEQ: usize = 4096;
+// prefill tile: 16 tokens x 2880 int8 activations = 46KB, L1-resident on M4 P-cores
+// (128KB L1d); a weight row fetched from DRAM once serves 16 dots. 32 regressed (92KB).
+const TILE: usize = 16;
 /// top-K each worker keeps from the Q4 head screen; NT*CAND rows get exact Q8 refine
 const CAND: usize = 8;
 const NP: usize = 12;        // P-core workers (weight 5)
@@ -642,6 +645,8 @@ struct Shared {
     // control
     tseq: AtomicU64, ready: AtomicU64, cur_tok: AtomicU32, cur_pos: AtomicUsize,
     want_logits: AtomicBool, result: AtomicU32,
+    // batched prefill: bsz > 0 switches the dispatch to forward_tile_worker
+    bsz: AtomicUsize, cur_pos0: AtomicUsize, btoks: *mut u32,
     // barrier (the last arriver also resets the work-steal counter for the next stage)
     bcount: AtomicUsize, bsense: AtomicBool, wctr: AtomicUsize,
     // park (between tokens only)
@@ -657,6 +662,11 @@ struct Shared {
     rlogits: *mut f32, logits: *mut f32, cand: *mut u64, cand_logit: *mut f32,
     scores: *mut f32, partials: *mut f32,
     kc: *mut f32, vc: *mut f32,   // [nl][MAXSEQ*nkv*hd] flattened
+    // tile buffers ([TILE] token-major)
+    x_b: *mut f32, xn_b: *mut f32, xq_b: *mut i8, xsb_b: *mut f32,
+    q_b: *mut f32, ao_b: *mut f32, aq_b: *mut i8, asb_b: *mut f32,
+    gu_b: *mut f32, hq_b: *mut i8, hsb_b: *mut f32, ffn4_b: *mut f32,
+    rlogits_b: *mut f32,
 }
 unsafe impl Send for Shared {} unsafe impl Sync for Shared {}
 
@@ -919,6 +929,16 @@ fn forward_worker(sh: &Shared, wid: usize, ls: &mut bool) {
             if let Some(t)=_td { TM[2].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
         }
         if !sh.want_logits.load(Ordering::Relaxed) { return; }
+        head_worker(sh, wid, ls);
+    }
+}
+
+/// Two-stage head (Q4 screen, exact Q8 refine) + sampling. Shared by the
+/// single-token and batched-prefill paths; expects x to hold the final hidden state.
+fn head_worker(sh: &Shared, wid: usize, ls: &mut bool) {
+    let c = *cfg();
+    let (d, nb) = (c.d, c.blocks);
+    unsafe {
         let _th = if wid==0 { Some(Instant::now()) } else { None };
         // ---- head: two-stage, Q4 screen then exact Q8 refine ----
         // The head is 201088x2880 — at Q8 it was 25% of ALL bytes moved per token.
@@ -978,6 +998,254 @@ fn forward_worker(sh: &Shared, wid: usize, ls: &mut bool) {
             sh.result.store(chosen, Ordering::Relaxed);
         }
         if let Some(t)=_th { TM[3].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
+    }
+}
+
+/// Batched prefill tile: same math and per-dot fp order as forward_worker, so the
+/// result is BIT-IDENTICAL to feeding the tile token-by-token. The speed comes from
+/// loop order only: weight row OUTER, tile tokens INNER, so a row fetched from DRAM
+/// once serves up to TILE dots against L1-resident activations (8 x 2880 int8 = 23KB).
+/// Causality: all of the tile's k/v is written (stage 2) before any attention reads
+/// (stage 3), and token b only attends positions <= pos0+b, exactly like the serial
+/// path. The head runs only when want_logits (the prompt's last tile).
+fn forward_tile_worker(sh: &Shared, wid: usize, ls: &mut bool) {
+    let c = *cfg();
+    let (d, nh, nkv, hd, nb) = (c.d, c.nh, c.nkv, c.hd, c.blocks);
+    let topk = c.topk;
+    let dq = d / 4;
+    let bsz = sh.bsz.load(Ordering::Relaxed);
+    let pos0 = sh.cur_pos0.load(Ordering::Relaxed);
+    let anb = (nh * hd) / 32;
+    unsafe {
+        // ---- embed all tile tokens ----
+        { steal(sh, bsz * d / 32, |it| {
+            let (b, blk) = (it / (d / 32), it % (d / 32));
+            let tokid = *sh.btoks.add(b) as usize;
+            for j in blk * 32..blk * 32 + 32 {
+                *sh.x_b.add(b * d + j) = f32::from_bits((*sh.tok_embd.add(tokid * d + j) as u32) << 16);
+            }
+          }); }
+        bar(sh, ls);
+
+        for il in 0..c.nl {
+            let ly = &sh.layers[il];
+            let kcl = sh.kc.add(il * MAXSEQ * nkv * hd);
+            let vcl = sh.vc.add(il * MAXSEQ * nkv * hd);
+            // ---- attn rmsnorm + quant, per token ----
+            { let mut inv = [0f32; TILE];
+              for b in 0..bsz { inv[b] = 1.0 / (ssq(sh.x_b.add(b * d), d) / d as f32 + c.rms_eps).sqrt(); }
+              steal(sh, bsz * nb, |it| {
+                let (b, blk) = (it / nb, it % nb);
+                let (xp, np) = (sh.x_b.add(b * d), sh.xn_b.add(b * d));
+                for i in blk * 32..blk * 32 + 32 { *np.add(i) = *xp.add(i) * inv[b] * ly.attn_norm[i]; }
+                qblock32(np, sh.xq_b.add(b * d), sh.xsb_b.add(b * nb), blk);
+              }); }
+            bar(sh, ls);
+            // ---- qkv + rope + kv-cache, head-major, weight row reused across tokens ----
+            { steal(sh, nh + nkv, |h| {
+                if h < nh {
+                    let base = h * hd;
+                    for r in 0..hd {
+                        for b in 0..bsz {
+                            *sh.q_b.add(b * nh * hd + base + r) =
+                                ly.wq.dot(base + r, sh.xq_b.add(b * d), sh.xsb_b.add(b * nb)) + ly.bq[base + r];
+                        }
+                    }
+                    for b in 0..bsz { rope_yarn(sh.q_b.add(b * nh * hd + base), pos0 + b); }
+                } else {
+                    let hh = h - nh;
+                    let base = hh * hd;
+                    // k/v rows straight into the cache slot for each tile position
+                    for r in 0..hd {
+                        for b in 0..bsz {
+                            let pos = pos0 + b;
+                            *kcl.add((pos * nkv + hh) * hd + r) =
+                                ly.wk.dot(base + r, sh.xq_b.add(b * d), sh.xsb_b.add(b * nb)) + ly.bk[base + r];
+                            *vcl.add((pos * nkv + hh) * hd + r) =
+                                ly.wv.dot(base + r, sh.xq_b.add(b * d), sh.xsb_b.add(b * nb)) + ly.bv[base + r];
+                        }
+                    }
+                    for b in 0..bsz { rope_yarn(kcl.add(((pos0 + b) * nkv + hh) * hd), pos0 + b); }
+                }
+              }); }
+            bar(sh, ls);
+            // ---- attention per (token, head), causal ----
+            { let scale = 1.0 / (hd as f32).sqrt();
+              steal(sh, bsz * nh, |it| {
+                let (b, h) = (it / nh, it % nh);
+                let pos = pos0 + b;
+                let start = if (il + 1) % 2 != 0 { pos.saturating_sub(c.swa - 1) } else { 0 };
+                let kvh = h / (nh / nkv);
+                let sc = sh.scores.add(wid * MAXSEQ);
+                let qh = sh.q_b.add(b * nh * hd + h * hd);
+                for t in start..=pos {
+                    let kp = kcl.add((t * nkv + kvh) * hd);
+                    let mut a0 = vdupq_n_f32(0.0); let mut a1 = vdupq_n_f32(0.0);
+                    let mut a2 = vdupq_n_f32(0.0); let mut a3 = vdupq_n_f32(0.0);
+                    let mut j = 0;
+                    while j < hd {
+                        a0 = vfmaq_f32(a0, vld1q_f32(kp.add(j)), vld1q_f32(qh.add(j)));
+                        a1 = vfmaq_f32(a1, vld1q_f32(kp.add(j + 4)), vld1q_f32(qh.add(j + 4)));
+                        a2 = vfmaq_f32(a2, vld1q_f32(kp.add(j + 8)), vld1q_f32(qh.add(j + 8)));
+                        a3 = vfmaq_f32(a3, vld1q_f32(kp.add(j + 12)), vld1q_f32(qh.add(j + 12)));
+                        j += 16;
+                    }
+                    *sc.add(t - start) = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3))) * scale;
+                }
+                let n = pos - start + 1;
+                let mut mx = ly.sinks[h];
+                for t in 0..n { let v = *sc.add(t); if v > mx { mx = v; } }
+                let mut den = (ly.sinks[h] - mx).exp();
+                for t in 0..n { let e = (*sc.add(t) - mx).exp(); *sc.add(t) = e; den += e; }
+                let aop = sh.ao_b.add(b * nh * hd + h * hd);
+                let mut acc = [vdupq_n_f32(0.0); 16];
+                for (ti, t) in (start..=pos).enumerate() {
+                    let vp = vcl.add((t * nkv + kvh) * hd); let sct = *sc.add(ti);
+                    for u in 0..16 { acc[u] = vfmaq_n_f32(acc[u], vld1q_f32(vp.add(u * 4)), sct); }
+                }
+                let inv = 1.0 / den;
+                for u in 0..16 { vst1q_f32(aop.add(u * 4), vmulq_n_f32(acc[u], inv)); }
+                let (aqb, asbb) = (sh.aq_b.add(b * nh * hd), sh.asb_b.add(b * anb));
+                qblock32(sh.ao_b.add(b * nh * hd), aqb, asbb, 2 * h);
+                qblock32(sh.ao_b.add(b * nh * hd), aqb, asbb, 2 * h + 1);
+              }); }
+            bar(sh, ls);
+            // ---- o-proj, row-major, tokens inner ----
+            { steal(sh, d, |r| {
+                for b in 0..bsz {
+                    *sh.x_b.add(b * d + r) += ly.wo.dot(r, sh.aq_b.add(b * nh * hd), sh.asb_b.add(b * anb)) + ly.bo[r];
+                }
+              }); }
+            bar(sh, ls);
+            // ---- ffn rmsnorm + quant + router ----
+            { let mut inv = [0f32; TILE];
+              for b in 0..bsz { inv[b] = 1.0 / (ssq(sh.x_b.add(b * d), d) / d as f32 + c.rms_eps).sqrt(); }
+              steal(sh, bsz * nb, |it| {
+                let (b, blk) = (it / nb, it % nb);
+                let (xp, np) = (sh.x_b.add(b * d), sh.xn_b.add(b * d));
+                for i in blk * 32..blk * 32 + 32 { *np.add(i) = *xp.add(i) * inv[b] * ly.ffn_norm[i]; }
+                qblock32(np, sh.xq_b.add(b * d), sh.xsb_b.add(b * nb), blk);
+              }); }
+            bar(sh, ls);
+            // router, expert-major so the ginp row is read once per tile
+            { steal(sh, c.ne, |e| {
+                for b in 0..bsz {
+                    let mut acc = ly.ginp_b[e];
+                    let xnp = sh.xn_b.add(b * d);
+                    for j in 0..d { acc += ly.ginp[e * d + j] * *xnp.add(j); }
+                    *sh.rlogits_b.add(b * c.ne + e) = acc;
+                }
+              }); }
+            bar(sh, ls);
+            // per-token top-k, redundant per worker (bsz * ne scan, trivial)
+            let mut tops = [[0usize; 8]; TILE];
+            let mut wts = [[0f32; 8]; TILE];
+            for b in 0..bsz {
+                let mut top = [0usize; 8];
+                let mut tv = [f32::MIN; 8];
+                for e in 0..c.ne {
+                    let v = *sh.rlogits_b.add(b * c.ne + e);
+                    if v > tv[topk - 1] {
+                        let mut p = topk - 1;
+                        while p > 0 && tv[p - 1] < v { tv[p] = tv[p - 1]; top[p] = top[p - 1]; p -= 1; }
+                        tv[p] = v; top[p] = e;
+                    }
+                }
+                let lmax = tv[0];
+                let mut wsum = 0f32; let mut ex = [0f32; 8];
+                for i in 0..topk { ex[i] = (tv[i] - lmax).exp(); wsum += ex[i]; }
+                for i in 0..topk { wts[b][i] = ex[i] / wsum; }
+                tops[b] = top;
+            }
+            // expert subscriber lists: which (token, slot) pairs want each expert
+            let mut subs: [[(u8, u8); TILE]; 32] = [[(0, 0); TILE]; 32];
+            let mut nsub = [0usize; 32];
+            let mut active = [0usize; 32];
+            let mut nact = 0;
+            for b in 0..bsz {
+                for ei in 0..topk {
+                    let e = tops[b][ei];
+                    if nsub[e] == 0 { active[nact] = e; nact += 1; }
+                    subs[e][nsub[e]] = (b as u8, ei as u8);
+                    nsub[e] += 1;
+                }
+            }
+            // ---- gate/up, expert-major: each quad row read once, all subscribers served ----
+            { steal(sh, nact * 2 * dq, |it| {
+                let ai = it / (2 * dq);
+                let e = active[ai];
+                let rem = it % (2 * dq);
+                let (w, bias, qd) = if rem < dq { (&ly.gate, &ly.gate_b, rem) }
+                                    else { (&ly.up, &ly.up_b, rem - dq) };
+                let off = if rem < dq { 0 } else { d };
+                let qg = e * dq + qd;
+                for si in 0..nsub[e] {
+                    let (b, ei) = (subs[e][si].0 as usize, subs[e][si].1 as usize);
+                    let acc = dot4_mx_i8(w.nib.as_ptr().add(qg * nb * 64), w.exps.as_ptr().add(qg * nb * 4),
+                                         sh.xq_b.add(b * d), sh.xsb_b.add(b * nb));
+                    let ob = sh.gu_b.add(((b * topk + ei) * 2) * d + off + qd * 4);
+                    for i in 0..4 { *ob.add(i) = acc[i] + bias[e * d + qd * 4 + i]; }
+                }
+              }); }
+            bar(sh, ls);
+            // ---- act + quant ----
+            { const ALPHA: f32 = 1.702; const LIM: f32 = 7.0;
+              steal(sh, bsz * topk * nb, |it| {
+                let (bei, blk) = (it / nb, it % nb);
+                let g = sh.gu_b.add(bei * 2 * d + blk * 32);
+                let u = sh.gu_b.add(bei * 2 * d + d + blk * 32);
+                let mut h = [0f32; 32];
+                let mut amax = 1e-12f32;
+                for k in 0..32 {
+                    let xg = (*g.add(k)).min(LIM);
+                    let yu = (*u.add(k)).clamp(-LIM, LIM);
+                    let v = (xg / (1.0 + (-ALPHA * xg).exp())) * (yu + 1.0);
+                    h[k] = v;
+                    amax = amax.max(v.abs());
+                }
+                let sc = amax / 127.0;
+                *sh.hsb_b.add(bei * nb + blk) = sc;
+                let qp = sh.hq_b.add(bei * d + blk * 32);
+                for k in 0..32 { *qp.add(k) = (h[k] / sc).round().clamp(-127.0, 127.0) as i8; }
+              }); }
+            bar(sh, ls);
+            // ---- down, expert-major into ffn4_b (no write races), then accumulate ----
+            { steal(sh, nact * dq, |it| {
+                let ai = it / dq;
+                let e = active[ai];
+                let qd = it % dq;
+                let qg = e * dq + qd;
+                for si in 0..nsub[e] {
+                    let (b, ei) = (subs[e][si].0 as usize, subs[e][si].1 as usize);
+                    let bei = b * topk + ei;
+                    let acc = dot4_mx_i8(ly.down.nib.as_ptr().add(qg * nb * 64), ly.down.exps.as_ptr().add(qg * nb * 4),
+                                         sh.hq_b.add(bei * d), sh.hsb_b.add(bei * nb));
+                    let ob = sh.ffn4_b.add(bei * d + qd * 4);
+                    for i in 0..4 { *ob.add(i) = acc[i] + ly.down_b[e * d + qd * 4 + i]; }
+                }
+              }); }
+            bar(sh, ls);
+            // weighted residual accumulate, ei ascending (same fp order as decode/serial)
+            { steal(sh, bsz * dq, |it| {
+                let (b, qd) = (it / dq, it % dq);
+                let mut sacc = [0f32; 4];
+                for i in 0..4 { sacc[i] = *sh.x_b.add(b * d + qd * 4 + i); }
+                for ei in 0..topk {
+                    let bei = b * topk + ei;
+                    for i in 0..4 { sacc[i] += wts[b][ei] * *sh.ffn4_b.add(bei * d + qd * 4 + i); }
+                }
+                for i in 0..4 { *sh.x_b.add(b * d + qd * 4 + i) = sacc[i]; }
+              }); }
+            bar(sh, ls);
+        }
+        if !sh.want_logits.load(Ordering::Relaxed) { return; }
+        // ---- head on the tile's LAST token: copy into the single-token x, reuse
+        // the existing two-stage head verbatim ----
+        { let last = bsz - 1;
+          let (a, b) = sl(wid, d);
+          for j in a..b { *sh.x.add(j) = *sh.x_b.add(last * d + j); } }
+        bar(sh, ls);
+        head_worker(sh, wid, ls);
     }
 }
 
@@ -1063,6 +1331,8 @@ fn main() {
     let sh: &'static Shared = Box::leak(Box::new(Shared {
         tseq: AtomicU64::new(0), ready: AtomicU64::new(0), cur_tok: AtomicU32::new(0), cur_pos: AtomicUsize::new(0),
         want_logits: AtomicBool::new(true), result: AtomicU32::new(0),
+        bsz: AtomicUsize::new(0), cur_pos0: AtomicUsize::new(0),
+        btoks: Box::leak(vec![0u32; TILE].into_boxed_slice()).as_mut_ptr(),
         bcount: AtomicUsize::new(0), bsense: AtomicBool::new(false), wctr: AtomicUsize::new(0),
         m: std::sync::Mutex::new(()), cv: std::sync::Condvar::new(),
         dm: std::sync::Mutex::new(()), dcv: std::sync::Condvar::new(),
@@ -1075,6 +1345,10 @@ fn main() {
         cand: mk_u64(32 * CAND), cand_logit: mk_f(32 * CAND),
         scores: mk_f(32 * MAXSEQ), partials: mk_f(32),
         kc: mk_f(c.nl * MAXSEQ * nkv * hd), vc: mk_f(c.nl * MAXSEQ * nkv * hd),
+        x_b: mk_f(TILE * d), xn_b: mk_f(TILE * d), xq_b: mk_i8(TILE * d), xsb_b: mk_f(TILE * c.blocks),
+        q_b: mk_f(TILE * nh * hd), ao_b: mk_f(TILE * nh * hd), aq_b: mk_i8(TILE * nh * hd), asb_b: mk_f(TILE * (nh * hd) / 32),
+        gu_b: mk_f(TILE * c.topk * 2 * d), hq_b: mk_i8(TILE * c.topk * d), hsb_b: mk_f(TILE * c.topk * c.blocks),
+        ffn4_b: mk_f(TILE * c.topk * d), rlogits_b: mk_f(TILE * c.ne),
     }));
 
     // spawn workers
@@ -1089,21 +1363,35 @@ fn main() {
                 { let mut g = sh.m.lock().unwrap();
                   while sh.tseq.load(Ordering::Acquire) == seen { g = sh.cv.wait(g).unwrap(); }
                   seen = sh.tseq.load(Ordering::Acquire); }
-                forward_worker(sh, wid, &mut ls);
+                if sh.bsz.load(Ordering::Relaxed) > 0 { forward_tile_worker(sh, wid, &mut ls); }
+                else { forward_worker(sh, wid, &mut ls); }
                 bar(sh, &mut ls); // all workers finish the token before signaling done
                 if wid == 0 { let _g = sh.dm.lock().unwrap(); sh.ready.store(seen, Ordering::Release); sh.dcv.notify_one(); }
             }
         });
     }
-    let run = |t: u32, pos: usize, want: bool| -> u32 {
-        sh.cur_tok.store(t, Ordering::Relaxed);
-        sh.cur_pos.store(pos, Ordering::Relaxed);
-        sh.want_logits.store(want, Ordering::Relaxed);
+    let dispatch = || {
         let s = sh.tseq.load(Ordering::Relaxed) + 1;
         { let _g = sh.m.lock().unwrap(); sh.tseq.store(s, Ordering::Release); sh.cv.notify_all(); }
         { let mut g = sh.dm.lock().unwrap(); while sh.ready.load(Ordering::Acquire) < s { g = sh.dcv.wait(g).unwrap(); } }
         sh.result.load(Ordering::Relaxed)
     };
+    let run = |t: u32, pos: usize, want: bool| -> u32 {
+        sh.bsz.store(0, Ordering::Relaxed);
+        sh.cur_tok.store(t, Ordering::Relaxed);
+        sh.cur_pos.store(pos, Ordering::Relaxed);
+        sh.want_logits.store(want, Ordering::Relaxed);
+        dispatch()
+    };
+    // batched prefill tile (<= TILE tokens starting at pos0); result valid when want
+    let run_tile = |toks: &[u32], pos0: usize, want: bool| -> u32 {
+        unsafe { for (b, &t) in toks.iter().enumerate() { *sh.btoks.add(b) = t; } }
+        sh.bsz.store(toks.len(), Ordering::Relaxed);
+        sh.cur_pos0.store(pos0, Ordering::Relaxed);
+        sh.want_logits.store(want, Ordering::Relaxed);
+        dispatch()
+    };
+    let nobatch = std::env::var("CPBRR_NOBATCH").is_ok();
 
     let serve = prompt == "--serve";
     let cli_ngen: Option<usize> = args.get(4).and_then(|s| s.parse().ok());
@@ -1126,7 +1414,16 @@ fn main() {
         ids.extend(encode("assistant"));
         let t1 = Instant::now();
         let mut next = 0u32;
-        for (i, &t) in ids.iter().enumerate() { next = run(t, i, i == ids.len() - 1); }
+        if nobatch {
+            for (i, &t) in ids.iter().enumerate() { next = run(t, i, i == ids.len() - 1); }
+        } else {
+            let mut p0 = 0;
+            while p0 < ids.len() {
+                let e = (p0 + TILE).min(ids.len());
+                next = run_tile(&ids[p0..e], p0, e == ids.len());
+                p0 = e;
+            }
+        }
         let pf = t1.elapsed().as_secs_f64();
         // reset stage counters so the printed profile reflects DECODE only
         for s in &TM { s.store(0, Ordering::Relaxed); }
