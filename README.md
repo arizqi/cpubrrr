@@ -222,7 +222,11 @@ work, in order:
 2. **[Benchmark llama.cpp BLAS builds (BLIS / oneAPI / OpenBLAS)](https://github.com/arizqi/cpubrrr/issues/2)** —
    a self-contained measurement task, good first contribution.
 3. **[Improve prefill throughput](https://github.com/arizqi/cpubrrr/issues/3)** — the one
-   place llama.cpp still beats us; compute-bound GEMM, different problem than decode.
+   place llama.cpp still beats us. Measured 2026-08-02 on Qwen3-Coder-30B, same session:
+   our token-by-token prefill 56 tok/s vs upstream's batched pp512 at 87. Notably NOT an
+   Accelerate/BLAS effect — upstream's pp got *slower* with BLAS enabled (78 vs 87); its
+   win is its own batched int8 path processing many tokens per weight pass. Batched
+   prefill exists in `engine.rs` (`BATCH_PREFILL=1`) but is not yet in the newer engines.
 
 House rules are short (see [CONTRIBUTING.md](CONTRIBUTING.md)): verify kernels against an
 oracle before wiring them in, and land every perf claim with before/after numbers in the
@@ -233,8 +237,11 @@ research log. Beating our numbers is a welcome contribution.
 This is a **research engine**, not a production server (no cross-user batching, no
 serving hardening). Numbers are Apple M4; the techniques port to other ARM and (with
 AVX-512) x86, but those numbers must be measured, not assumed. A `training/kernel`
-research track programs the M4's SME/AMX matrix unit directly from Rust assembly
-(~4.2 TFLOPS fp32, measured to exceed Accelerate) — see the research log. On training
+research track programs the M4's SME2 matrix unit directly from Rust assembly. An
+earlier claim here of "~4.2 TFLOPS, exceeds Accelerate" did not survive re-measurement
+(2026-08-02, loaded machine): best hand-written SME 2.4 TFLOPS vs Accelerate's 3.4 on
+the same run. Treat Accelerate as ahead until a quiet-machine rerun says otherwise —
+see the research log. On training
 scale: consumer CPUs can realistically train models up to ~1B params; a
 trillion-parameter model is ~47,000 years of compute (physics, not pessimism).
 

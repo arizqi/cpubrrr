@@ -965,3 +965,26 @@ Note also that "strongest available baseline" now has a second axis: build. Home
 b9860 tuned beats July's source build on gpt-oss (78.5 vs 66.8) but LOSES on qwen
 (65.5 vs 77.5). There is no single "upstream llama.cpp number" -- there is a number
 per (build, flags, thread count, model), and any honest ratio has to name all four.
+
+### Prefill and SME claims, re-measured (2026-08-02, loaded desktop)
+
+Applied lesson #7 to the two claims that had never been through it.
+
+Prefill, Qwen3-Coder-30B, same session: upstream pp512 swept -t 8/10/12 gives 87.3
+best (-dev none). Control WITH the BLAS backend allowed: 78.4 -- slower. So the
+README's "loses to llama.cpp's Accelerate GEMM" had the mechanism wrong: quantized
+MoE prefill doesn't go through BLAS at all; llama.cpp wins with its own batched int8
+path. Our side: 644-token prompt through engine_qwen2's token-by-token prefill =
+56.1 tok/s. Honest statement: we lose prefill 0.64x, and the fix is batching (one
+weight pass serving many tokens), not a GEMM library.
+
+SME: bench_sme today has Accelerate at 2978-3412 GFLOPS across 512-4096 while the
+best hand-written SME kernel (v3 4T) peaks at 2418. The README's "~4.2 TFLOPS,
+measured to exceed Accelerate" did not reproduce; corrected the README to say
+Accelerate is ahead until a quiet-machine rerun. Machine was loaded (~1.2 cores
+lost), which depresses both sides but cannot explain a 4.2 -> 2.4 collapse on ours
+while Accelerate holds 3.4.
+
+Pattern across the day: five separate published claims (5x, parity, qwen 1.17x,
+prefill-vs-GEMM, SME-beats-Accelerate) and none of them survived re-measurement in
+their original form. The kernels were never the weak layer. The claims were.
