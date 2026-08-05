@@ -32,3 +32,7 @@ metal/sync_lat3
 metal/disp_cost
 metal/mmap_bw
 metal/engine_metal
+
+# GSM8K eval cache (downloaded, not source)
+.eval_cache/
+.upstream_gguf/
