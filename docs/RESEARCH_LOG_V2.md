@@ -943,3 +943,25 @@ BEHIND. The honest current statement is:
 
 Not 5x, not 2x, not 1.6x. 1.17x, and the number moved three times today purely from
 fixing how it was measured.
+
+### Qwen re-measurement (same day, same discipline)
+
+Swept upstream on Qwen3-Coder-30B Q4_K too: -t 6 = 52.4, -t 8 = 64.4, **-t 10 = 65.5**,
+-t 12 = 59.0. engine_qwen2 in the same session: 68.1 best. That is ~1.04x, not the
+~1.17x this repo published.
+
+Three things differ from the published run and I can't separate them today: the
+desktop was busy (~1.2 cores lost to WindowServer/apps), this is homebrew's b9860
+rather than July's `-DGGML_METAL=OFF` source build (which measured 77.5 on qwen --
+HIGHER than this build reaches at any thread count), and engine_qwen2 has none of
+today's work (stealing, barrier reduction, Q4 head).
+
+So the qwen row is WITHDRAWN from the README rather than restated at either value.
+Publishing the old number would be quoting an untuned baseline; publishing 1.04x
+would be quoting a contaminated machine. Neither is a measurement. Re-run on a quiet
+box, with the current optimizations ported to engine_qwen2, before it goes back up.
+
+Note also that "strongest available baseline" now has a second axis: build. Homebrew's
+b9860 tuned beats July's source build on gpt-oss (78.5 vs 66.8) but LOSES on qwen
+(65.5 vs 77.5). There is no single "upstream llama.cpp number" -- there is a number
+per (build, flags, thread count, model), and any honest ratio has to name all four.

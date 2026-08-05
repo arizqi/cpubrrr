@@ -4,29 +4,48 @@
 https://github.com/user-attachments/assets/a390cb6e-86b8-41e5-9ef6-957c94dabe19
 
 
-**From-scratch CPU-only LLM inference. Faster than upstream llama.cpp on Q4_K, at parity on MXFP4 — and ~5× Ollama's bundled runner. No GPU.**
+**From-scratch CPU-only LLM inference on Apple silicon. ~1.17× upstream llama.cpp on gpt-oss MXFP4, measured same-session with both sides tuned. No GPU.**
 
 `cpubrrr` is a research runtime that runs frontier-class **mixture-of-experts** models
 on an Apple M4 Max **CPU only** — the binary links nothing but the C standard library,
 so it *physically cannot* touch the GPU (`otool -L target/release/engine` to verify). It
 started as a one-model experiment (gpt-oss:20b) and now runs four MoE models across two
-architectures and two quantization formats from one config-driven engine. Against
-**upstream llama.cpp** it is ~1.17× faster on Q4_K (llama.cpp's own hand-tuned home
-turf) and at parity on MXFP4; against Ollama's bundled runner it is ~5× on gpt-oss.
+architectures and two quantization formats from one config-driven engine.
 
-## Numbers (Apple M4 Max, CPU only, log-verified 0 GPU layers, cool + quiet machine)
+## Numbers (Apple M4 Max, CPU only, same session, both sides at their own best thread count)
 
-| model (CPU decode) | cpubrrr | upstream llama.cpp (b7e1e28c) | Ollama bundled runner |
+| model (CPU decode) | cpubrrr | upstream llama.cpp (b9860) | ratio |
 |---|---|---|---|
-| **gpt-oss:20b** MXFP4 | **~68–77 tok/s** | ~67 tok/s (parity) | ~14 tok/s (~5×) |
-| **Qwen3-Coder-30B** Q4_K | **~90 tok/s** | ~77 tok/s (**~1.17×**) | ~82 tok/s |
+| **gpt-oss:20b** MXFP4 | **90.1 tok/s** (NT=10) | **76.95 tok/s** (`-t 8`) | **~1.17×** |
 
-**Correction (2026-07-27, prompted by reddit user Fedor_Doc):** earlier versions of
-this README said "beats llama.cpp ~5×" on gpt-oss. That baseline was **Ollama's
-bundled runner**, not upstream llama.cpp — upstream handles MXFP4 MoE fine, and
-against it we are at parity on gpt-oss. The Q4_K win stands against the strongest
-baseline. Lesson #6 in the research log: benchmark the strongest available baseline,
-and name the exact implementation.
+GSM8K 98/100 for cpubrrr on those same weights — identical to the score they get
+through Ollama, so the speed is not bought with accuracy.
+
+Upstream is forced genuinely CPU-only with `-dev none -ngl 0`; this build ships a
+Metal backend, and this repo has been burned once already by a "CPU" baseline quietly
+using the GPU. cpubrrr additionally decodes with a 73-token prompt in context
+(pos 73→201) while `llama-bench tg128` runs pos 0→128, so cpubrrr is measured at
+higher positions — the handicap runs against us.
+
+**Correction (2026-08-02) — LESSON #7: a baseline is a *configuration*, not a binary.**
+Every earlier comparison in this repo ran upstream at `-t 12`. On this chip that is
+close to llama.cpp's *worst* setting (`-t 8` = 78.5, `-t 10` = 69.6, `-t 12` = 47.7,
+`-t 16` = 11.4) — 61% of its own best. Measured that way the same binaries read
+"1.62×", which would have been a headline built entirely on the opponent's
+misconfiguration. Consequences:
+
+- The old **"parity on MXFP4"** claim was against a mistuned upstream. Against a
+  properly tuned one, the *older* engine (68.5) was **behind**, not level. The 1.17×
+  above comes from the current engine, which is 1.28× faster than that older one.
+- The old **Qwen3-Coder-30B "~1.17× (90 vs 77)"** row is **withdrawn pending
+  re-measurement.** Re-run same-session on 2026-08-02 it gave 68.1 vs 65.5 (≈1.04×) —
+  but on a loaded desktop, with a different llama.cpp build, and with the Qwen engine
+  not yet carrying the current engine's optimizations. Rather than publish either the
+  old unverified number or today's contaminated one, it is pulled until it can be run
+  on a quiet machine.
+- Remaining caveat on the number above: it is measured against llama.cpp b9860 as
+  packaged by Homebrew. A source build with native flags may be faster still; that
+  combination has not been tuned and tested here.
 
 Decode throughput, several runs each. Output verified correct in both cases. llama.cpp
 placement confirmed CPU-only from Ollama's own server logs (it defaults to Metal GPU on
